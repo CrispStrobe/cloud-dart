@@ -1,0 +1,78 @@
+name: cloud_dart
+description: Flutter/Dart Cloud storage client for Filen.io
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # State Management
+  provider: ^6.1.1
+  
+  # UI
+  desktop_drop:         
+    git:
+      url: https://github.com/CrispStrobe/flutter-plugins.git
+      path: packages/desktop_drop
+
+  # File Handling
+  cross_file: ^0.3.3+8
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  
+  # Sharing
+  share_plus: ^7.2.2
+  receive_sharing_intent: ^1.5.3
+  
+  # Networking & Crypto (from your original code)
+  http: ^1.2.0
+  args: ^2.4.2
+  crypto: ^3.0.3
+  pointycastle: ^3.7.3
+  bip39: ^1.0.6
+  hex: ^0.2.0
+  glob: ^2.1.2
+  file_picker: ^10.3.3
+  shared_preferences: ^2.5.3
+  file_selector: ^1.0.4
+  file_selector_macos: ^0.9.4+5
+  url_launcher: ^6.3.2
+  flutter_launcher_icons: ^0.14.4
+  macos_secure_bookmarks: ^0.2.1
+
+  # WebDAV Dependencies
+  shelf: ^1.4.0
+  shelf_router: ^1.1.0 # Good for adding other handlers
+  shelf_dav: ^1.0.0  # The server
+  file: ^7.0.0       # The virtual filesystem interface
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  
+  # App Icons
+  assets:
+    - assets/images/app_icon.png # Add your new icon path
+
+flutter_launcher_icons:
+  image_path: "assets/images/app_icon.png"
+  
+  # Mobile Platforms (boolean 'true' is fine)
+  android: true
+  ios: true
+  
+  # Desktop Platforms (must be configured as a map to enable generation)
+  macos:
+    generate: true
+  windows:
+    generate: true
+  linux:
+    generate: true

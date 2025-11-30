@@ -1,0 +1,10 @@
+# linux/internxt_drive.desktop
+[Desktop Entry]
+Name=Internxt Drive
+Comment=Secure cloud storage
+Exec=internxt_drive %U
+Icon=internxt_drive
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;
+MimeType=x-scheme-handler/internxtdrive;
