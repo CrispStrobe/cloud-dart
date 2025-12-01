@@ -1,7 +1,7 @@
 #!/usr/bin/env dart
 
 /// ---------------------------------------------------------------------------
-/// FILEN CLI (v0.0.3)
+/// FILEN CLI (v0.0.4)
 /// ---------------------------------------------------------------------------
 
 import 'dart:async';
@@ -1690,6 +1690,9 @@ class FilenClient {
   String baseFolderUUID = '';
   List<String>? masterKeys = [];
   String? email = '';
+  
+  // Cache path strings to UUIDs/Metadata to speed up batch ops
+  final Map<String, Map<String, dynamic>> _pathCache = {}; // Cache for path -> info
 
   // Caching
   static const Duration _cacheDuration = Duration(minutes: 10);
@@ -2108,6 +2111,7 @@ class FilenClient {
   void _invalidateCache(String folderUuid) {
     _folderCache.remove(folderUuid);
     _fileCache.remove(folderUuid);
+    // _pathCache.clear(); // Clear path cache to be safe
     _log('Cache invalidated for folder: $folderUuid');
   }
 
@@ -2287,6 +2291,115 @@ class FilenClient {
     _invalidateCache(parent);
   }
 
+  /// Helper to fetch and organize the flat tree for O(1) lookups
+  Future<Map<String, List<Map<String, dynamic>>>> _fetchAndParseTree(String rootUuid) async {
+    final treeData = await getFlatFolderTree(rootUuid);
+    
+    final rawFolders = treeData['folders'] as List? ?? [];
+    // API might return 'files' or 'uploads'
+    final rawFiles = (treeData['files'] as List?) ?? (treeData['uploads'] as List?) ?? [];
+    
+    if (debugMode) {
+      print("🔍 [DEBUG] Tree fetched: ${rawFolders.length} folders, ${rawFiles.length} files");
+    }
+
+    // Adjacency Map: ParentUUID -> List of Children
+    final adjacency = <String, List<Map<String, dynamic>>>{};
+
+    // 1. Process Folders
+    for (var f in rawFolders) {
+      try {
+        String uuid, encName, parent;
+        
+        // Handle Optimized List [uuid, name, parent]
+        if (f is List) {
+          if (f.length < 3) continue;
+          uuid = f[0]; encName = f[1]; parent = f[2];
+        } else {
+          // Handle Dict
+          if (f['deleted'] == true || f['trash'] == true) continue;
+          uuid = f['uuid']; encName = f['name']; parent = f['parent'];
+        }
+
+        var decName = await _tryDecrypt(encName);
+        if (decName.startsWith('{')) {
+          decName = json.decode(decName)['name'];
+        }
+
+        final item = {
+          'uuid': uuid, 
+          'name': decName, 
+          'parent': parent, 
+          'type': 'folder'
+        };
+
+        if (!adjacency.containsKey(parent)) adjacency[parent] = [];
+        adjacency[parent]!.add(item);
+      } catch (_) {}
+    }
+
+    // 2. Process Files
+    for (var f in rawFiles) {
+      try {
+        String uuid, encMeta, parent;
+        
+        // Handle Optimized List [uuid, bucket, region, chunks, parent, meta]
+        if (f is List) {
+          if (f.length < 6) continue;
+          uuid = f[0]; parent = f[4]; encMeta = f[5];
+        } else {
+          // Handle Dict
+          if (f['deleted'] == true || f['trash'] == true) continue;
+          uuid = f['uuid']; parent = f['parent']; encMeta = f['metadata'];
+        }
+
+        final decMeta = await _tryDecrypt(encMeta);
+        final meta = json.decode(decMeta);
+        
+        final item = {
+          'uuid': uuid,
+          'name': meta['name'] ?? 'Unknown',
+          'parent': parent,
+          'type': 'file',
+          'size': meta['size'] ?? 0
+        };
+
+        if (!adjacency.containsKey(parent)) adjacency[parent] = [];
+        adjacency[parent]!.add(item);
+      } catch (_) {}
+    }
+
+    return adjacency;
+  }
+
+  Future<Map<String, dynamic>> getFlatFolderTree(String folderUuid) async {
+    // FIX: Use _uuid() to generate a valid UUID v4, not _randomString
+    final deviceId = _uuid(); 
+    
+    if (debugMode) {
+      print("🔍 [DEBUG] Fetching flat tree for $folderUuid (DeviceID: $deviceId)...");
+    }
+    
+    // Use /v3/dir/tree with integer skipCache
+    final response = await _makeRequest(
+      'POST',
+      Uri.parse('$apiUrl/v3/dir/tree'),
+      body: json.encode({
+        'uuid': folderUuid,
+        'deviceId': deviceId,
+        'skipCache': 0 
+      }),
+    );
+
+    final data = json.decode(response.body);
+    
+    if (data['status'] != true) {
+      throw Exception(data['message'] ?? 'Failed to fetch tree');
+    }
+    
+    return data['data'] ?? {};
+  }
+
   Future<Map<String, dynamic>> createFolderRecursive(String path,
       {String? creationTime, String? modificationTime}) async {
     if (baseFolderUUID.isEmpty) throw Exception("Not logged in");
@@ -2296,10 +2409,15 @@ class FilenClient {
       return {'uuid': baseFolderUUID, 'plainName': 'Root', 'path': '/'};
     }
 
+    // --- CACHE CHECK ---
+    if (_pathCache.containsKey(cleanPath)) {
+      return _pathCache[cleanPath]!;
+    }
+
     var parts = cleanPath.split('/');
     var currentParentUuid = baseFolderUUID;
     var currentPath = '/';
-    Map<String, dynamic>? currentFolderInfo = {
+    Map<String, dynamic> currentFolderInfo = {
       'uuid': baseFolderUUID,
       'plainName': 'Root',
       'path': '/'
@@ -2310,105 +2428,80 @@ class FilenClient {
       if (part.isEmpty) continue;
 
       final isLastPart = (i == parts.length - 1);
-      final partPath = '$currentPath/$part'.replaceAll('//', '/');
+      final partPathStr = '$currentPath$part/'.replaceAll('//', '/');
+      final cleanPartPath = partPathStr.replaceAll(RegExp(r'/$'), '');
 
-      Map<String, dynamic>? foundFolder;
+      // Check cache for this level
+      if (_pathCache.containsKey(cleanPartPath)) {
+        currentFolderInfo = _pathCache[cleanPartPath]!;
+        currentParentUuid = currentFolderInfo['uuid'];
+        currentPath = partPathStr;
+        continue;
+      }
 
-      try {
-        final folders = await listFoldersAsync(currentParentUuid);
-        for (var folder in folders) {
-          if (folder['name'] == part) {
-            foundFolder = folder;
+      // Check if folder exists in current_uuid
+      final folders = await listFoldersAsync(currentParentUuid);
+      Map<String, dynamic>? found;
+
+      for (var folder in folders) {
+        if (folder['name'] == part) {
+          found = folder;
+          break;
+        }
+      }
+
+      if (found != null) {
+        currentParentUuid = found['uuid'];
+        currentFolderInfo = found;
+        currentFolderInfo['path'] = cleanPartPath;
+        currentPath = partPathStr;
+        
+        // Update Cache
+        _pathCache[cleanPartPath] = currentFolderInfo;
+      } else {
+        _log("Creating folder: $part in $currentPath");
+        try {
+          await createDirectory(
+            part,
+            currentParentUuid,
+            creationTime: isLastPart ? creationTime : null,
+            modificationTime: isLastPart ? modificationTime : null,
+          );
+        } catch (e) {
+          if (e.toString().contains('409') || e.toString().contains('already exists')) {
+             _log('Conflict (409), re-fetching...');
+             await Future.delayed(Duration(milliseconds: 500));
+             _invalidateCache(currentParentUuid);
+          } else {
+            throw e;
+          }
+        }
+
+        // Re-fetch
+        await Future.delayed(Duration(milliseconds: 200));
+        _invalidateCache(currentParentUuid);
+        final foldersAfter = await listFoldersAsync(currentParentUuid);
+        
+        Map<String, dynamic>? newFolder;
+        for (var f in foldersAfter) {
+          if (f['name'] == part) {
+            newFolder = f;
             break;
           }
         }
 
-        if (foundFolder != null) {
-          currentParentUuid = foundFolder['uuid'];
-          foundFolder['path'] = partPath;
-          currentFolderInfo = foundFolder;
-          currentPath = partPath;
-          _log("Found existing folder: $part");
+        if (newFolder == null) throw Exception("Created folder but couldn't find it: $part");
 
-          if (isLastPart &&
-              (creationTime != null || modificationTime != null)) {
-            _log('Warning: Folder exists, cannot update timestamps');
-          }
-        } else {
-          _log("Creating folder: $part in $currentPath");
-          try {
-            await createDirectory(
-              part,
-              currentParentUuid,
-              creationTime: isLastPart ? creationTime : null,
-              modificationTime: isLastPart ? modificationTime : null,
-            );
-
-            // Re-fetch to get the new folder's UUID
-            await Future.delayed(Duration(milliseconds: 500));
-            _invalidateCache(currentParentUuid);
-            final foldersAfter = await listFoldersAsync(currentParentUuid);
-
-            Map<String, dynamic>? newFolder;
-            for (var f in foldersAfter) {
-              if (f['name'] == part) {
-                newFolder = f;
-                break;
-              }
-            }
-
-            if (newFolder != null) {
-              currentParentUuid = newFolder['uuid'];
-              newFolder['path'] = partPath;
-              currentFolderInfo = newFolder;
-              currentPath = partPath;
-              _log("Created successfully: $part");
-            } else {
-              throw Exception("Created folder but couldn't find it");
-            }
-          } on Exception catch (e) {
-            if (e.toString().contains('409') ||
-                e.toString().contains('already exists')) {
-              _log('Conflict (409), re-fetching...');
-              await Future.delayed(Duration(seconds: 1));
-
-              _invalidateCache(currentParentUuid);
-              final foldersAfterConflict =
-                  await listFoldersAsync(currentParentUuid);
-
-              Map<String, dynamic>? conflictingFolder;
-              for (var f in foldersAfterConflict) {
-                if (f['name'] == part) {
-                  conflictingFolder = f;
-                  break;
-                }
-              }
-
-              if (conflictingFolder != null) {
-                currentParentUuid = conflictingFolder['uuid'];
-                conflictingFolder['path'] = partPath;
-                currentFolderInfo = conflictingFolder;
-                currentPath = partPath;
-                _log('Re-fetched after 409');
-              } else {
-                throw Exception("Folder conflict but couldn't find it");
-              }
-            } else {
-              throw e;
-            }
-          }
-        }
-      } catch (e) {
-        throw Exception("Failed to process folder part '$part': $e");
+        currentParentUuid = newFolder['uuid'];
+        currentFolderInfo = newFolder;
+        currentFolderInfo['path'] = cleanPartPath;
+        currentPath = partPathStr;
+        
+        // Update Cache
+        _pathCache[cleanPartPath] = currentFolderInfo;
       }
     }
 
-    if (currentFolderInfo == null) {
-      throw Exception("Failed to resolve final folder");
-    }
-    if (currentFolderInfo['path'] == null) {
-      currentFolderInfo['path'] = currentPath;
-    }
     return currentFolderInfo;
   }
 
@@ -2417,12 +2510,14 @@ class FilenClient {
     final endpoint = type == 'folder' ? '/v3/dir/move' : '/v3/file/move';
     await _post(endpoint, {'uuid': uuid, 'to': destUuid});
     _invalidateCache(destUuid);
+    _pathCache.clear(); // Path structure changed, must clear path cache
   }
 
   Future<void> trashItem(String uuid, String type) async {
     await _clearParentCache(uuid, type);
     final endpoint = type == 'folder' ? '/v3/dir/trash' : '/v3/file/trash';
     await _post(endpoint, {'uuid': uuid});
+    _pathCache.clear(); // Item removed from path, clear cache
   }
 
   Future<void> restoreItem(String uuid, String type) async {
@@ -2476,6 +2571,7 @@ class FilenClient {
         'nameHashed': nameHashed
       });
     }
+    _pathCache.clear(); // Name changed, paths are invalid
   }
 
   Future<Map<String, dynamic>> getFileMetadata_old(String uuid) async {
@@ -2660,10 +2756,6 @@ class FilenClient {
   // 7. UPDATE: Upload with chunk-level resume
   // ============================================================================
 
-  // ============================================================================
-// FIXED: upload - Better resume detection and logging
-// ============================================================================
-
   Future<void> upload(
     List<String> sources,
     String targetPath, {
@@ -2688,101 +2780,28 @@ class FilenClient {
       print("🔄 Resuming batch...");
       batchState = initialBatchState;
       tasks = batchState['tasks'] as List<dynamic>;
-
-      // DEBUG: Show what we're resuming
-      _log("Batch state loaded:");
-      _log("  Total tasks: ${tasks.length}");
-      for (var i = 0; i < tasks.length; i++) {
-        final task = tasks[i];
-        _log(
-            "  Task $i: status=${task['status']}, lastChunk=${task['lastChunk']}, uuid=${task['fileUuid']?.toString().substring(0, min(8, task['fileUuid']?.toString().length ?? 0))}...");
-      }
     } else {
       print("🔍 Building task list...");
       tasks = [];
 
-      final targetFolderInfo = await _resolveOrCreateFolder(targetPath);
-      final targetFolderUuid = targetFolderInfo['uuid'];
-      _log("Target folder UUID: $targetFolderUuid");
-
+      // Loop over sources to build task list (same as before)
       for (final sourceArg in sources) {
-        final hasTrailingSlash =
-            sourceArg.endsWith('/') || sourceArg.endsWith('\\');
-        final glob = Glob(sourceArg.replaceAll('\\', '/'));
-
-        await for (final entity in glob.list()) {
-          if (await FileSystemEntity.isDirectory(entity.path)) {
-            if (!recursive) {
-              _log("Skipping directory (not recursive): ${entity.path}");
-              continue;
-            }
-
-            final localDir = Directory(entity.path);
-            String? dirCreationTime;
-            String? dirModTime;
-
-            if (preserveTimestamps) {
-              try {
-                final stat = await localDir.stat();
-                dirModTime = stat.modified.toUtc().toIso8601String();
-                dirCreationTime = stat.changed.toUtc().toIso8601String();
-              } catch (_) {}
-            }
-
-            String remoteBase;
-            if (hasTrailingSlash) {
-              remoteBase = targetPath;
-            } else {
-              final dirName = p.basename(localDir.path);
-              remoteBase = p.join(targetPath, dirName).replaceAll('\\', '/');
-            }
-
-            _log("Creating remote directory: $remoteBase");
-            await createFolderRecursive(
-              remoteBase,
-              creationTime: dirCreationTime,
-              modificationTime: dirModTime,
-            );
-
-            await for (final fileEntity
-                in localDir.list(recursive: true, followLinks: false)) {
-              if (fileEntity is File) {
-                final relativePath =
-                    p.relative(fileEntity.path, from: localDir.path);
-                final remoteFilePath =
-                    p.join(remoteBase, relativePath).replaceAll('\\', '/');
-
-                if (shouldIncludeFile(
-                    p.basename(fileEntity.path), include, exclude)) {
-                  tasks.add({
-                    'localPath': fileEntity.path,
-                    'remotePath': remoteFilePath,
-                    'status': 'pending',
-                    'fileUuid': null,
-                    'uploadKey': null,
-                    'lastChunk': -1,
-                  });
-                }
-              }
-            }
-          } else if (await FileSystemEntity.isFile(entity.path)) {
-            final localFile = File(entity.path);
-            final remoteFilePath = p
-                .join(targetPath, p.basename(localFile.path))
-                .replaceAll('\\', '/');
-
-            if (shouldIncludeFile(
-                p.basename(localFile.path), include, exclude)) {
-              tasks.add({
-                'localPath': localFile.path,
-                'remotePath': remoteFilePath,
-                'status': 'pending',
-                'fileUuid': null,
-                'uploadKey': null,
-                'lastChunk': -1,
-              });
-            }
-          }
+        // Check for wildcards
+        if (sourceArg.contains('*') || sourceArg.contains('?') || sourceArg.contains('[')) {
+           final glob = Glob(sourceArg.replaceAll('\\', '/'));
+           await for (final entity in glob.list()) {
+              await _processEntityForUpload(entity, sourceArg, targetPath, recursive, include, exclude, tasks, preserveTimestamps);
+           }
+        } else {
+           // Explicit path
+           final type = await FileSystemEntity.type(sourceArg);
+           if (type == FileSystemEntityType.directory) {
+              await _processEntityForUpload(Directory(sourceArg), sourceArg, targetPath, recursive, include, exclude, tasks, preserveTimestamps);
+           } else if (type == FileSystemEntityType.file) {
+              await _processEntityForUpload(File(sourceArg), sourceArg, targetPath, recursive, include, exclude, tasks, preserveTimestamps);
+           } else {
+              _log("⚠️ Source not found: $sourceArg");
+           }
         }
       }
 
@@ -2799,29 +2818,34 @@ class FilenClient {
     int skippedCount = 0;
     int errorCount = 0;
     int completedPreviously = 0;
+    
+    final totalTasks = tasks.length;
 
-    for (int i = 0; i < tasks.length; i++) {
+    // Use a single progress line for the whole batch
+    for (int i = 0; i < totalTasks; i++) {
       final task = tasks[i] as Map<String, dynamic>;
       final localPath = task['localPath'] as String;
       final remotePath = task['remotePath'] as String;
       final status = task['status'] as String;
-      final fileUuid = task['fileUuid'] as String?;
-      final uploadKey = task['uploadKey'] as String?;
-      final lastChunk = task['lastChunk'] as int? ?? -1;
+      final remoteName = p.basename(remotePath);
 
-      // DEBUG: Show task details
-      _log("Processing task $i:");
-      _log("  Local: $localPath");
-      _log("  Remote: $remotePath");
-      _log("  Status: $status");
-      _log(
-          "  FileUUID: ${fileUuid?.substring(0, min(8, fileUuid.length)) ?? 'null'}");
-      _log(
-          "  UploadKey: ${uploadKey?.substring(0, min(8, uploadKey?.length ?? 0)) ?? 'null'}");
-      _log("  LastChunk: $lastChunk");
+      // --- Progress Bar ---
+      final pct = totalTasks > 0 ? ((i) / totalTasks * 100).toStringAsFixed(1) : '0.0';
+      final width = 20;
+      final filled = totalTasks > 0 ? ((i / totalTasks) * width).round() : 0;
+      final bar = '█' * filled + '░' * (width - filled);
+      
+      if (!debugMode) {
+        // Clean progress line
+        final shortName = remoteName.length > 20 ? remoteName.substring(0, 17) + '...' : remoteName;
+        stdout.write('\rUp: ${shortName.padRight(20)} |$bar| ${i+1}/$totalTasks ($pct%)  ');
+      } else {
+        _log("Processing ${i+1}/$totalTasks: $remoteName ($status)");
+      }
 
       if (status == 'completed') {
         completedPreviously++;
+        if (i == totalTasks -1 && !debugMode) stdout.write('\n'); 
         continue;
       }
       if (status.startsWith('skipped')) {
@@ -2831,169 +2855,158 @@ class FilenClient {
 
       final localFile = File(localPath);
       if (!await localFile.exists()) {
-        print("⚠️ Source missing: ${p.basename(localPath)}");
+        if (debugMode) print("⚠️ Source missing: $localPath");
         skippedCount++;
         task['status'] = 'skipped_missing';
         await saveStateCallback(batchState);
         continue;
       }
 
+      // Resolve Parent (Uses Optimized Cache)
       final remoteParentPath = p.dirname(remotePath).replaceAll('\\', '/');
-      final remoteFileName = p.basename(remotePath);
-
-      Map<String, dynamic> parentFolderInfo;
-
+      Map<String, dynamic> parentInfo;
       try {
-        parentFolderInfo = await createFolderRecursive(remoteParentPath);
+        parentInfo = await createFolderRecursive(remoteParentPath);
       } catch (e) {
-        print("❌ Error creating parent $remoteParentPath: $e");
+        if (debugMode) print("❌ Error creating parent: $e");
         errorCount++;
         task['status'] = 'error_parent';
-        await saveStateCallback(batchState);
         continue;
       }
 
-      // Check conflict (only for new uploads, not resumes)
-      if (fileUuid == null) {
-        final exists =
-            await checkFileExists(parentFolderInfo['uuid'], remoteFileName);
-        if (exists) {
-          if (onConflict == 'skip') {
-            print("⏭️ Skipping: $remoteFileName (exists)");
-            skippedCount++;
-            task['status'] = 'skipped_conflict';
-            await saveStateCallback(batchState);
-            continue;
-          }
+      // Check Conflict (Uses Cache)
+      bool shouldUpload = true;
+      if (task['fileUuid'] == null) {
+        // Optimization: check local file list cache before API
+        final cachedFiles = _fileCache[parentInfo['uuid']]?.items;
+        bool exists = false;
+        if (cachedFiles != null) {
+           exists = (cachedFiles as List).any((f) => f['name'] == remoteName);
+        } else {
+           exists = await checkFileExists(parentInfo['uuid'], remoteName);
+        }
+
+        if (exists && onConflict == 'skip') {
+           if (debugMode) print("⏭️ Skipping: $remoteName (exists)");
+           skippedCount++;
+           task['status'] = 'skipped_conflict';
+           await saveStateCallback(batchState);
+           shouldUpload = false;
         }
       }
 
+      if (!shouldUpload) continue;
+
+      // Upload
       try {
         final fileSize = await localFile.length();
-
-        // Better resume detection
-        final isResuming = (status == 'interrupted' || status == 'uploading') &&
-            lastChunk >= 0;
-
-        if (isResuming) {
-          print(
-              "📤 Resuming: $remoteFileName from chunk ${lastChunk + 1} (${formatSize(fileSize)})");
-          _log("  Will resume with UUID: ${fileUuid?.substring(0, 8)}");
-          _log("  Will resume with UploadKey: ${uploadKey?.substring(0, 8)}");
-        } else {
-          print("📤 Uploading: $remoteFileName (${formatSize(fileSize)})");
-        }
-
-        String? creationTime;
-        String? modificationTime;
-
+        
+        String? cTime, mTime;
         if (preserveTimestamps) {
-          try {
-            final stat = await localFile.stat();
-            modificationTime = stat.modified.millisecondsSinceEpoch.toString();
-            creationTime = stat.changed.millisecondsSinceEpoch.toString();
-          } catch (_) {}
+           final stat = await localFile.stat();
+           mTime = stat.modified.millisecondsSinceEpoch.toString();
+           cTime = stat.changed.millisecondsSinceEpoch.toString();
         }
 
-        // Mark as uploading before starting
         task['status'] = 'uploading';
         await saveStateCallback(batchState);
 
-        // Track last save time to avoid saving too frequently
-        DateTime lastSaveTime = DateTime.now();
-        int lastSavedChunk = lastChunk;
-
-        final result = await uploadFileChunked(
+        await uploadFileChunked(
           localFile,
-          parentFolderInfo['uuid'],
-          fileUuid: fileUuid,
-          creationTime: creationTime,
-          modificationTime: modificationTime,
-          resumeUploadKey: uploadKey,
-          resumeFromChunk: isResuming ? (lastChunk + 1) : 0,
+          parentInfo['uuid'],
+          fileUuid: task['fileUuid'],
+          resumeUploadKey: task['uploadKey'],
+          resumeFromChunk: (task['lastChunk'] ?? -1) + 1,
+          creationTime: cTime,
+          modificationTime: mTime,
           onUploadStart: (uuid, key) {
-            if (debugMode) {
-              _log(
-                  "Upload started, saving initial state: uuid=${uuid.substring(0, 8)}, key=${key.substring(0, 8)}");
-            }
-            task['fileUuid'] = uuid;
-            task['uploadKey'] = key;
-            task['lastChunk'] = -1;
-            saveStateCallback(batchState);
+             task['fileUuid'] = uuid;
+             task['uploadKey'] = key;
+             task['lastChunk'] = -1;
+             saveStateCallback(batchState);
           },
-          onProgress: onFileProgress == null
-              ? null
-              : (current, total, bytesUploaded, totalBytes) {
-                  task['lastChunk'] = current - 1;
-
-                  final now = DateTime.now();
-                  final shouldSave = (current - lastSavedChunk >= 10) ||
-                      (now.difference(lastSaveTime).inSeconds >= 5);
-
-                  if (shouldSave) {
-                    if (debugMode) {
-                      _log("Saving progress: chunk ${current - 1}");
-                    }
-                    saveStateCallback(batchState).then((_) {
-                      lastSaveTime = DateTime.now();
-                      lastSavedChunk = current - 1;
-                    });
-                  }
-
-                  onFileProgress(remoteFileName, current, total, bytesUploaded,
-                      totalBytes);
-                },
+          onProgress: (cur, tot, bUp, bTot) {
+             task['lastChunk'] = cur - 1;
+          }
         );
-
-// Show hash after upload
-        print("   ✅ Upload complete");
-        print("   📊 SHA-512: ${result['hash']?.substring(0, 64)}...");
-        if (debugMode) {
-          print("   🆔 UUID: ${result['uuid']}");
-        }
 
         successCount++;
         task['status'] = 'completed';
         task['fileUuid'] = null;
         task['uploadKey'] = null;
         task['lastChunk'] = -1;
-      } on ChunkUploadException catch (e) {
-        print("\n⚠️ Upload interrupted: ${e.message}");
-        task['fileUuid'] = e.fileUuid;
-        task['uploadKey'] = e.uploadKey;
-        task['lastChunk'] = e.lastSuccessfulChunk;
-        task['status'] = 'interrupted';
-        errorCount++;
-        await saveStateCallback(batchState);
-        print("💾 Progress saved:");
-        print("   UUID: ${e.fileUuid.substring(0, 16)}...");
-        print("   Upload Key: ${e.uploadKey.substring(0, 16)}...");
-        print("   Last successful chunk: ${e.lastSuccessfulChunk}");
-        print("   Run again to resume from chunk ${e.lastSuccessfulChunk + 1}");
-      } catch (e, stack) {
-        print("\n❌ Upload error: $e");
-        if (debugMode) {
-          print("Stack trace:");
-          print(stack);
-        }
-        errorCount++;
-        task['status'] = 'error_upload';
-      }
 
+      } catch (e) {
+        if (debugMode) print("\n❌ Upload error: $e");
+        errorCount++;
+        task['status'] = 'interrupted';
+      }
+      
       await saveStateCallback(batchState);
     }
+    
+    if (!debugMode) stdout.write('\n'); // Newline after progress bar
 
-    print("=" * 40);
-    print("📊 Upload Summary:");
-    if (completedPreviously > 0) print("  ✅ Previous: $completedPreviously");
-    print("  ✅ Uploaded: $successCount");
-    print("  ⏭️ Skipped: $skippedCount");
-    print("  ❌ Errors: $errorCount");
-    print("=" * 40);
+    print('=' * 40);
+    print('📊 Upload Summary:');
+    if (completedPreviously > 0) print('  ✅ Previous: $completedPreviously');
+    print('  ✅ Uploaded: $successCount');
+    print('  ⏭️  Skipped: $skippedCount');
+    print('  ❌ Errors: $errorCount');
+    print('=' * 40);
+    
+    if (errorCount > 0) throw Exception("Upload finished with errors");
+  }
 
-    if (errorCount > 0) {
-      throw Exception("Upload completed with $errorCount errors");
-    }
+  // Helper for upload recursion
+  Future<void> _processEntityForUpload(FileSystemEntity entity, String sourceBase, String targetPath, bool recursive, List<String> include, List<String> exclude, List<dynamic> tasks, bool preserveTimestamps) async {
+      if (entity is Directory) {
+          if (!recursive) {
+            _log("Skipping directory: ${entity.path}");
+            return;
+          }
+          
+          final localDir = Directory(entity.path);
+          String remoteBase;
+          if (sourceBase.endsWith(Platform.pathSeparator) || sourceBase == '.' || sourceBase == './') {
+             remoteBase = targetPath;
+          } else {
+             remoteBase = p.join(targetPath, p.basename(localDir.path)).replaceAll('\\', '/');
+          }
+
+          // Pre-create folder to ensure empty dirs are uploaded
+          await createFolderRecursive(remoteBase);
+
+          await for (final fileEntity in localDir.list(recursive: true, followLinks: false)) {
+            if (fileEntity is File) {
+              final relPath = p.relative(fileEntity.path, from: localDir.path);
+              final remotePath = p.join(remoteBase, relPath).replaceAll('\\', '/');
+              
+              if (shouldIncludeFile(p.basename(fileEntity.path), include, exclude)) {
+                tasks.add({
+                  'localPath': fileEntity.path,
+                  'remotePath': remotePath,
+                  'status': 'pending',
+                  'fileUuid': null,
+                  'uploadKey': null,
+                  'lastChunk': -1,
+                });
+              }
+            }
+          }
+      } else if (entity is File) {
+          final remotePath = p.join(targetPath, p.basename(entity.path)).replaceAll('\\', '/');
+          if (shouldIncludeFile(p.basename(entity.path), include, exclude)) {
+             tasks.add({
+              'localPath': entity.path,
+              'remotePath': remotePath,
+              'status': 'pending',
+              'fileUuid': null,
+              'uploadKey': null,
+              'lastChunk': -1,
+            });
+          }
+      }
   }
 
   Future<Map<String, dynamic>> _resolveOrCreateFolder(String path) async {
@@ -3125,285 +3138,252 @@ class FilenClient {
     required String batchId,
     Map<String, dynamic>? initialBatchState,
     required Future<void> Function(Map<String, dynamic>) saveStateCallback,
-    Function(String filename, int bytesDownloaded, int totalBytes)?
-        onFileProgress,
   }) async {
+    // 1. Resolve Root Item
     final itemInfo = await resolvePath(remotePath);
 
+    // 2. Handle Single File
     if (itemInfo['type'] == 'file') {
       final filename = p.basename(remotePath);
-
-      if (!shouldIncludeFile(filename, include, exclude)) {
-        print('🚫 Filtered out: $filename');
-        return;
+      if (!shouldIncludeFile(filename, include, exclude)) return;
+      
+      final localPath = localDestination != null && FileSystemEntity.isDirectorySync(localDestination)
+          ? p.join(localDestination, filename)
+          : (localDestination ?? filename);
+          
+      // Check conflict
+      if (File(localPath).existsSync() && onConflict == 'skip') {
+         print('⏭️  Skipping: $filename (exists)');
+         return;
       }
-
-      String localPath;
-      if (localDestination != null) {
-        final destEntity = FileSystemEntity.typeSync(localDestination);
-        if (destEntity == FileSystemEntityType.directory) {
-          localPath = p.join(localDestination, filename);
-        } else {
-          localPath = localDestination;
-        }
-      } else {
-        localPath = filename;
-      }
-
-      final localFile = File(localPath);
-
-      if (await localFile.exists()) {
-        if (onConflict == 'skip') {
-          print('⏭️  Skipping: $localPath (exists)');
-          return;
-        } else if (onConflict == 'newer') {
-          final metadata = itemInfo['metadata'];
-          final remoteModTime =
-              metadata?['lastModified'] ?? metadata?['timestamp'];
-
-          if (remoteModTime != null) {
-            final localStat = await localFile.stat();
-            final localModTime = localStat.modified;
-
-            DateTime remoteDateTime;
-            if (remoteModTime is int) {
-              remoteDateTime =
-                  DateTime.fromMillisecondsSinceEpoch(remoteModTime);
-            } else {
-              remoteDateTime = DateTime.parse(remoteModTime.toString());
-            }
-
-            if (!remoteDateTime.isAfter(localModTime)) {
-              print('⏭️  Skipping: $localPath (local is newer or same)');
-              return;
-            }
-            print('📥 Downloading: $filename (remote is newer)');
-          } else {
-            print('⚠️  Cannot compare timestamps, skipping: $localPath');
-            return;
-          }
-        }
-      }
-
+      
       print('📥 Downloading: $filename');
-      final result = await downloadFile(
-        itemInfo['uuid'],
-        savePath: localPath,
-        onProgress: onFileProgress != null
-            ? (bytes, total) => onFileProgress(filename, bytes, total)
-            : null,
-      );
-
-      if (preserveTimestamps && result['modificationTime'] != null) {
-        try {
-          DateTime mTime;
-          if (result['modificationTime'] is int) {
-            mTime =
-                DateTime.fromMillisecondsSinceEpoch(result['modificationTime']);
-          } else {
-            mTime = DateTime.parse(result['modificationTime'].toString());
-          }
-          await localFile.setLastModified(mTime);
-          print('   🕐 Set timestamp: $mTime');
-        } catch (e) {
-          print('   ⚠️  Could not set timestamp: $e');
-        }
-      }
-
+      await downloadFile(itemInfo['uuid'], savePath: localPath);
       print('✅ Downloaded: $localPath');
       return;
     }
 
-    if (itemInfo['type'] == 'folder') {
-      if (!recursive) {
-        throw Exception(
-            "'$remotePath' is a folder. Use -r for recursive download.");
-      }
+    // 3. Handle Folder (Batch)
+    if (itemInfo['type'] != 'folder') throw Exception("Unknown type");
+    if (!recursive) throw Exception("Use -r for recursive download");
 
-      String baseDestPath;
-      if (localDestination != null) {
-        baseDestPath = localDestination;
-      } else {
-        final folderName = itemInfo['metadata']?['name'] ?? 'download';
-        baseDestPath = folderName;
-      }
+    final baseDestPath = localDestination ?? (itemInfo['metadata']?['name'] ?? 'download');
+    await Directory(baseDestPath).create(recursive: true);
+    
+    _log("Downloading folder: $remotePath to $baseDestPath");
 
-      final baseDestDir = Directory(baseDestPath);
-      await baseDestDir.create(recursive: true);
+    // 4. Batch Setup
+    Map<String, dynamic> batchState;
+    List<dynamic> tasks;
 
-      print('📂 Downloading folder: $remotePath');
-      print('💾 Target: ${baseDestDir.path}');
+    if (initialBatchState != null) {
+      print("🔄 Resuming batch...");
+      batchState = initialBatchState;
+      tasks = batchState['tasks'];
+    } else {
+      print("🔍 Building task list (Fast)...");
+      tasks = [];
 
-      Map<String, dynamic> batchState;
-      List<dynamic> tasks;
+      try {
+        // --- FAST TREE FETCH ---
+        final treeData = await getFlatFolderTree(itemInfo['uuid']);
+        
+        final rawFolders = treeData['folders'] as List? ?? [];
+        final rawFiles = (treeData['files'] as List?) ?? (treeData['uploads'] as List?) ?? [];
 
-      if (initialBatchState != null) {
-        print("🔄 Resuming batch...");
-        batchState = initialBatchState;
-        tasks = batchState['tasks'] as List<dynamic>;
-      } else {
-        print("🔍 Building task list...");
-        tasks = [];
+        _log("Tree response: ${rawFolders.length} folders, ${rawFiles.length} files");
 
-        Future<void> buildTasks(
-            String currentUuid, String currentRelPath) async {
-          final files = await listFolderFiles(currentUuid, detailed: true);
-          final folders = await listFoldersAsync(currentUuid, detailed: true);
-
-          for (var fileInfo in files) {
-            final filename = fileInfo['name'] ?? 'file';
-            final localFilePath =
-                p.join(baseDestPath, currentRelPath, filename);
-
-            if (shouldIncludeFile(filename, include, exclude)) {
-              tasks.add({
-                'remoteUuid': fileInfo['uuid'],
-                'localPath': localFilePath,
-                'status': 'pending',
-                'remoteModificationTime':
-                    fileInfo['lastModified'] ?? fileInfo['timestamp'],
-              });
+        // Map Folders: UUID -> {name, parent}
+        final folderMap = <String, Map<String, dynamic>>{};
+        
+        for (var f in rawFolders) {
+          try {
+            String uuid, encName, parent;
+            
+            // Handle List vs Dict format
+            if (f is List) {
+               if (f.length < 3) continue;
+               uuid = f[0]; encName = f[1]; parent = f[2];
+            } else {
+               if (f['deleted'] == true || f['trash'] == true) continue;
+               uuid = f['uuid']; encName = f['name']; parent = f['parent'];
             }
-          }
 
-          for (var folderInfo in folders) {
-            final folderName = folderInfo['name'] ?? 'subfolder';
-            final nextRelPath = p.join(currentRelPath, folderName);
-            final localSubDir = Directory(p.join(baseDestPath, nextRelPath));
-            await localSubDir.create(recursive: true);
-
-            await buildTasks(folderInfo['uuid'], nextRelPath);
-          }
+            var decName = await _tryDecrypt(encName);
+            if (decName.startsWith('{')) {
+               decName = json.decode(decName)['name'];
+            }
+            folderMap[uuid] = {'name': decName, 'parent': parent};
+          } catch (_) {}
         }
 
-        await buildTasks(itemInfo['uuid'], '');
+        // Helper to reconstruct path
+        String? getRelPath(String? parentUuid) {
+           var parts = <String>[];
+           var curr = parentUuid;
+           var seen = <String>{};
+           
+           while (curr != null && curr != itemInfo['uuid']) {
+              if (seen.contains(curr)) return null; // Cycle
+              seen.add(curr);
+              
+              if (!folderMap.containsKey(curr)) return null; // Orphan
+              final f = folderMap[curr]!;
+              parts.add(f['name']);
+              curr = f['parent'];
+           }
+           if (curr == null && itemInfo['uuid'] != 'root') return null; // Didn't reach target root
+           return parts.reversed.join(Platform.pathSeparator);
+        }
 
-        batchState = {
-          'operationType': 'download',
-          'remotePath': remotePath,
-          'localDestination': baseDestPath,
-          'tasks': tasks,
-        };
-        await saveStateCallback(batchState);
-        print("📝 Task list: ${tasks.length} files");
+        // Process Files
+        for (var f in rawFiles) {
+           try {
+             String uuid, encMeta, parent;
+             
+             // Handle List vs Dict
+             if (f is List) {
+                // Correct indices based on Python findings:
+                // [uuid(0), bucket(1), region(2), chunks(3), parent(4), meta(5)]
+                if (f.length < 6) continue;
+                uuid = f[0]; parent = f[4]; encMeta = f[5];
+             } else {
+                if (f['deleted'] == true || f['trash'] == true) continue;
+                uuid = f['uuid']; parent = f['parent']; encMeta = f['metadata'];
+             }
+
+             final decMeta = await _tryDecrypt(encMeta);
+             final meta = json.decode(decMeta);
+             final filename = meta['name'];
+             final lastMod = meta['lastModified'] ?? 0;
+
+             if (!shouldIncludeFile(filename, include, exclude)) continue;
+
+             var relDir = getRelPath(parent);
+             // Handle files in root of request
+             if (parent == itemInfo['uuid']) relDir = '';
+             else if (relDir == null) continue;
+
+             final localPath = p.join(baseDestPath, relDir!, filename);
+             
+             tasks.add({
+               'remoteUuid': uuid,
+               'localPath': localPath,
+               'status': 'pending',
+               'remoteModificationTime': lastMod
+             });
+
+           } catch (e) {
+             _log("File parse error: $e");
+           }
+        }
+
+      } catch (e) {
+        throw Exception("Failed to fetch tree: $e");
       }
 
-      int successCount = 0;
-      int skippedCount = 0;
-      int errorCount = 0;
-      int completedPreviously = 0;
+      batchState = {
+        'operationType': 'download',
+        'remotePath': remotePath,
+        'localDestination': baseDestPath,
+        'tasks': tasks
+      };
+      await saveStateCallback(batchState);
+      print("📝 Task list: ${tasks.length} files");
+    }
 
-      for (int i = 0; i < tasks.length; i++) {
-        final task = tasks[i] as Map<String, dynamic>;
-        final remoteUuid = task['remoteUuid'] as String;
-        final localPath = task['localPath'] as String;
-        final status = task['status'] as String;
-        final remoteModTime = task['remoteModificationTime'];
+    // 5. Execution Loop
+    int successCount = 0;
+    int skippedCount = 0;
+    int errorCount = 0;
+    int completedPreviously = 0;
+    final totalTasks = tasks.length;
 
-        if (status == 'completed') {
-          completedPreviously++;
-          continue;
-        }
-        if (status.startsWith('skipped')) {
-          skippedCount++;
-          continue;
-        }
+    for (int i = 0; i < totalTasks; i++) {
+       final task = tasks[i] as Map<String, dynamic>;
+       final localPath = task['localPath'] as String;
+       final remoteUuid = task['remoteUuid'] as String;
+       final status = task['status'] as String;
+       final remoteModTime = task['remoteModificationTime'];
+       final filename = p.basename(localPath);
 
-        final localFile = File(localPath);
+       // Progress Bar
+       final pct = ((i) / totalTasks * 100).toStringAsFixed(1);
+       final width = 20;
+       final filled = ((i / totalTasks) * width).round();
+       final bar = '█' * filled + '░' * (width - filled);
+       if (!debugMode) {
+         stdout.write('\rDown: ${filename.padRight(20).substring(0, 20)} |$bar| ${i+1}/$totalTasks ($pct%)  ');
+       }
 
-        if (await localFile.exists()) {
+       if (status == 'completed') {
+         completedPreviously++;
+         continue;
+       }
+       if (status.startsWith('skipped')) {
+         skippedCount++;
+         continue;
+       }
+
+       // Create dir
+       await Directory(p.dirname(localPath)).create(recursive: true);
+       final localFile = File(localPath);
+
+       // Check conflict
+       if (await localFile.exists()) {
           if (onConflict == 'skip') {
-            print('⏭️  Skipping: ${p.basename(localPath)} (exists)');
-            skippedCount++;
-            task['status'] = 'skipped_conflict';
-            await saveStateCallback(batchState);
-            continue;
-          } else if (onConflict == 'newer') {
-            if (remoteModTime != null) {
-              final localStat = await localFile.stat();
-              final localModTime = localStat.modified;
-
-              DateTime remoteDateTime;
-              if (remoteModTime is int) {
-                remoteDateTime =
-                    DateTime.fromMillisecondsSinceEpoch(remoteModTime);
-              } else {
-                remoteDateTime = DateTime.parse(remoteModTime.toString());
-              }
-
-              if (!remoteDateTime.isAfter(localModTime)) {
-                print(
-                    '⏭️  Skipping: ${p.basename(localPath)} (local is newer)');
+             if (debugMode) print("Skipping $filename");
+             skippedCount++;
+             task['status'] = 'skipped_conflict';
+             await saveStateCallback(batchState);
+             continue;
+          }
+          if (onConflict == 'newer' && remoteModTime != null) {
+             final stat = await localFile.stat();
+             if (stat.modified.millisecondsSinceEpoch >= (remoteModTime is int ? remoteModTime : int.parse(remoteModTime.toString()))) {
                 skippedCount++;
                 task['status'] = 'skipped_newer';
                 await saveStateCallback(batchState);
                 continue;
-              }
-              print(
-                  '📥 Downloading: ${p.basename(localPath)} (remote is newer)');
-            } else {
-              print(
-                  '⚠️  Skipping: ${p.basename(localPath)} (cannot compare timestamps)');
-              skippedCount++;
-              task['status'] = 'skipped_no_timestamp';
-              await saveStateCallback(batchState);
-              continue;
+             }
+          }
+       }
+
+       // Download
+       try {
+         if (debugMode) print("Downloading $filename");
+         
+         // Using a silenced downloadFile call would be ideal, but here we capture output
+         final result = await downloadFile(remoteUuid, savePath: localPath);
+         
+         if (preserveTimestamps) {
+            final mt = result['modificationTime'] ?? remoteModTime;
+            if (mt != null) {
+               try {
+                 final dt = mt is int ? DateTime.fromMillisecondsSinceEpoch(mt) : DateTime.parse(mt.toString());
+                 await localFile.setLastModified(dt);
+               } catch (_) {}
             }
-          }
-        }
+         }
 
-        try {
-          if (onConflict != 'newer') {
-            print('📥 Downloading: ${p.basename(localPath)}');
-          }
-
-          final result = await downloadFile(
-            remoteUuid,
-            savePath: localPath,
-            onProgress: onFileProgress != null
-                ? (bytes, total) =>
-                    onFileProgress(p.basename(localPath), bytes, total)
-                : null,
-          );
-
-          final modTime = result['modificationTime'] ?? remoteModTime;
-          if (preserveTimestamps && modTime != null) {
-            try {
-              DateTime mTime;
-              if (modTime is int) {
-                mTime = DateTime.fromMillisecondsSinceEpoch(modTime);
-              } else {
-                mTime = DateTime.parse(modTime.toString());
-              }
-              await localFile.setLastModified(mTime);
-            } catch (e) {
-              _log('Could not set timestamp: $e');
-            }
-          }
-
-          successCount++;
-          task['status'] = 'completed';
-        } catch (e) {
-          print('❌ Download error: $e');
-          errorCount++;
-          task['status'] = 'error_download';
-        }
-
-        await saveStateCallback(batchState);
-      }
-
-      print("=" * 40);
-      print("📊 Download Summary:");
-      if (completedPreviously > 0) print("  ✅ Previous: $completedPreviously");
-      print("  ✅ Downloaded: $successCount");
-      print("  ⏭️  Skipped: $skippedCount");
-      print("  ❌ Errors: $errorCount");
-      print("=" * 40);
-
-      if (errorCount > 0) {
-        throw Exception("Download completed with $errorCount errors");
-      }
+         successCount++;
+         task['status'] = 'completed';
+       } catch (e) {
+         if (debugMode) print("Error: $e");
+         errorCount++;
+         task['status'] = 'error_download';
+       }
+       
+       await saveStateCallback(batchState);
     }
+
+    print('\n' + '=' * 40);
+    print('📊 Download Summary:');
+    if (completedPreviously > 0) print('  ✅ Previous: $completedPreviously');
+    print('  ✅ Downloaded: $successCount');
+    print('  ⏭️  Skipped: $skippedCount');
+    print('  ❌ Errors: $errorCount');
+    print('=' * 40);
   }
 
   // --- Trash Operations ---
@@ -3489,60 +3469,113 @@ class FilenClient {
 
   Future<List<Map<String, dynamic>>> findFiles(String startPath, String pattern,
       {int maxDepth = -1}) async {
-    final glob = Glob(pattern, caseSensitive: false);
-    final List<Map<String, dynamic>> results = [];
-
-    final List<MapEntry<String, int>> pathStack = [MapEntry(startPath, 0)];
-
-    while (pathStack.isNotEmpty) {
-      final entry = pathStack.removeLast();
-      final currentPath = entry.key;
-      final currentDepth = entry.value;
-
-      if (maxDepth != -1 && currentDepth >= maxDepth) continue;
-
-      Map<String, dynamic> resolved;
-      try {
-        resolved = await resolvePath(currentPath);
-        if (resolved['type'] != 'folder') continue;
-      } catch (e) {
-        _log('Could not resolve: $currentPath');
-        continue;
-      }
-
-      final currentUuid = resolved['uuid'];
-
-      try {
-        final files = await listFolderFiles(currentUuid);
-        for (var file in files) {
-          final name = file['name'] ?? '';
-
-          if (glob.matches(name)) {
-            final fullPath = '$currentPath/$name'.replaceAll('//', '/');
-            results.add({
-              ...file,
-              'fullPath': fullPath,
-            });
+    
+    // 1. Resolve Root to get UUID
+    final rootInfo = await resolvePath(startPath);
+    if (rootInfo['type'] != 'folder') return [];
+    
+    // 2. Fetch Flattened Tree (One API Call - Fast)
+    // This avoids making hundreds of API calls for recursive folders
+    final treeData = await getFlatFolderTree(rootInfo['uuid']);
+    final rawFolders = treeData['folders'] as List? ?? [];
+    final rawFiles = (treeData['files'] as List?) ?? (treeData['uploads'] as List?) ?? [];
+    
+    // 3. Build Folder Map (UUID -> {name, parent})
+    // We need this map to reconstruct full paths from parent UUIDs
+    final folderMap = <String, Map<String, dynamic>>{};
+    
+    for (var f in rawFolders) {
+       try {
+          String uuid, encName, parent;
+          
+          // Handle Optimized List Format [uuid, name, parent]
+          if (f is List) { 
+             if (f.length < 3) continue;
+             uuid = f[0]; encName = f[1]; parent = f[2]; 
+          } else { 
+             // Handle Standard Dict Format
+             if (f['deleted'] == true || f['trash'] == true) continue;
+             uuid = f['uuid']; encName = f['name']; parent = f['parent']; 
           }
-        }
-      } catch (e) {
-        _log('Could not list files in $currentPath: $e');
-      }
-
-      if (maxDepth == -1 || (currentDepth + 1) < maxDepth) {
-        try {
-          final folders = await listFoldersAsync(currentUuid);
-          for (var folder in folders) {
-            final folderName = folder['name'] ?? 'unknown';
-            final subPath = '$currentPath/$folderName'.replaceAll('//', '/');
-            pathStack.add(MapEntry(subPath, currentDepth + 1));
+          
+          var decName = await _tryDecrypt(encName);
+          if (decName.startsWith('{')) {
+             decName = json.decode(decName)['name'];
           }
-        } catch (e) {
-          _log('Could not list folders in $currentPath: $e');
-        }
-      }
+          folderMap[uuid] = {'name': decName, 'parent': parent};
+       } catch (_) {}
     }
 
+    final results = <Map<String, dynamic>>[];
+    final glob = Glob(pattern, caseSensitive: false);
+    
+    // Helper to reconstruct full path by tracing parents upwards
+    String? getFullPath(String? parentUuid) {
+        var parts = <String>[];
+        var curr = parentUuid;
+        var seen = <String>{}; // Cycle detection
+
+        while (curr != null && curr != rootInfo['uuid']) {
+           if (seen.contains(curr)) return null;
+           seen.add(curr);
+
+           if (!folderMap.containsKey(curr)) return null; // Orphaned
+           final f = folderMap[curr]!;
+           parts.add(f['name']);
+           curr = f['parent'];
+        }
+        
+        // If we ran out of parents but didn't hit the requested root, it's outside the scope
+        if (curr == null && rootInfo['uuid'] != 'root') return null;
+        
+        return p.join(startPath, parts.reversed.join('/'));
+    }
+
+    // 4. Process and Filter Files
+    for (var f in rawFiles) {
+       try {
+          String uuid, encMeta, parent;
+          
+          // Handle Optimized List Format 
+          // [uuid(0), bucket(1), region(2), chunks(3), parent(4), meta(5)]
+          if (f is List) { 
+             if (f.length < 6) continue;
+             uuid = f[0]; parent = f[4]; encMeta = f[5];
+          } else {
+             // Handle Standard Dict Format
+             if (f['deleted'] == true || f['trash'] == true) continue;
+             uuid = f['uuid']; parent = f['parent']; encMeta = f['metadata'];
+          }
+          
+          final meta = json.decode(await _tryDecrypt(encMeta));
+          final name = meta['name'];
+          
+          // Check Pattern
+          if (!glob.matches(name)) continue;
+          
+          // Reconstruct Path
+          var dirPath = getFullPath(parent);
+          
+          // Special case: File is directly in the start folder
+          if (parent == rootInfo['uuid']) dirPath = startPath;
+          else if (dirPath == null) continue;
+          
+          // Check Depth
+          if (maxDepth != -1) {
+             final relDepth = dirPath!.split('/').length - startPath.split('/').length;
+             if (relDepth >= maxDepth) continue;
+          }
+
+          results.add({
+             'uuid': uuid,
+             'name': name,
+             'fullPath': p.join(dirPath!, name).replaceAll('\\', '/'),
+             'size': meta['size'] ?? 0,
+             'lastModified': meta['lastModified'] ?? 0
+          });
+       } catch (_) {}
+    }
+    
     return results;
   }
 
@@ -3550,58 +3583,55 @@ class FilenClient {
     String path,
     void Function(String) printLine, {
     int maxDepth = 3,
-    int currentDepth = 0,
-    String prefix = "",
   }) async {
-    if (currentDepth >= maxDepth) return;
-
-    Map<String, dynamic> resolved;
     try {
-      resolved = await resolvePath(path);
-      if (resolved['type'] != 'folder') {
-        printLine("$prefix└── 📄 ${p.basename(path)}");
+      // 1. Resolve Root
+      final root = await resolvePath(path);
+      if (root['type'] != 'folder') {
+        printLine("└── 📄 ${p.basename(path)}");
         return;
       }
-    } catch (e) {
-      printLine("$prefix└── ❌ Error: $e");
-      return;
-    }
-
-    try {
-      final uuid = resolved['uuid'];
-      final folders = await listFoldersAsync(uuid);
-      final files = await listFolderFiles(uuid);
-      final allItems = [...folders, ...files];
-
-      if (allItems.isEmpty) return;
-
-      for (var i = 0; i < allItems.length; i++) {
-        final item = allItems[i];
-        final isLast = (i == allItems.length - 1);
-
-        final connector = isLast ? "└── " : "├── ";
-        final childPrefix = prefix + (isLast ? "    " : "│   ");
-
-        final name = item['name'] ?? 'Unknown';
-
-        if (item['type'] == 'folder') {
-          final folderPath = '$path/$name'.replaceAll('//', '/');
-          printLine("$prefix$connector📁 $name/");
-
-          await printTree(
-            folderPath,
-            printLine,
-            maxDepth: maxDepth,
-            currentDepth: currentDepth + 1,
-            prefix: childPrefix,
-          );
-        } else {
-          final size = formatSize(item['size'] ?? 0);
-          printLine("$prefix$connector📄 $name ($size)");
+      
+      final rootUuid = root['uuid'];
+      
+      // 2. Fetch Data Structure (Fast)
+      final adjacency = await _fetchAndParseTree(rootUuid);
+      
+      // 3. Recursive Print from Memory
+      void printNode(String parentUuid, int currentDepth, String prefix) {
+        if (currentDepth >= maxDepth) return;
+        
+        final children = adjacency[parentUuid] ?? [];
+        
+        // Sort: Folders first, then Files, alphabetically
+        children.sort((a, b) {
+          if (a['type'] != b['type']) {
+            return a['type'] == 'folder' ? -1 : 1; // Folder first
+          }
+          return (a['name'] as String).toLowerCase().compareTo((b['name'] as String).toLowerCase());
+        });
+        
+        for (var i = 0; i < children.length; i++) {
+          final item = children[i];
+          final isLast = (i == children.length - 1);
+          final connector = isLast ? "└── " : "├── ";
+          
+          if (item['type'] == 'folder') {
+            printLine("$prefix$connector📁 ${item['name']}/");
+            final childPrefix = prefix + (isLast ? "    " : "│   ");
+            printNode(item['uuid'], currentDepth + 1, childPrefix);
+          } else {
+            final size = formatSize(item['size']);
+            printLine("$prefix$connector📄 ${item['name']} ($size)");
+          }
         }
       }
+
+      // Start printing
+      printNode(rootUuid, 0, "");
+      
     } catch (e) {
-      printLine("$prefix└── ❌ Error: $e");
+      printLine("└── ❌ Error: $e");
     }
   }
 
@@ -3610,36 +3640,49 @@ class FilenClient {
   Future<Map<String, dynamic>> resolvePath(String path) async {
     if (baseFolderUUID.isEmpty) throw Exception("Not logged in");
 
-    String currentUuid = baseFolderUUID;
-    String resolvedPath = '/';
-
     var cleanPath = path.trim();
     if (cleanPath.startsWith('/')) cleanPath = cleanPath.substring(1);
-    if (cleanPath.endsWith('/'))
-      cleanPath = cleanPath.substring(0, cleanPath.length - 1);
+    if (cleanPath.endsWith('/')) cleanPath = cleanPath.substring(0, cleanPath.length - 1);
 
+    // Root check
     if (cleanPath.isEmpty || cleanPath == '.') {
       return {
         'type': 'folder',
-        'uuid': currentUuid,
-        'metadata': {'uuid': currentUuid, 'name': 'Root'},
+        'uuid': baseFolderUUID,
+        'metadata': {'uuid': baseFolderUUID, 'name': 'Root'},
         'path': '/'
       };
     }
 
+    // --- CHECK CACHE ---
+    if (_pathCache.containsKey(cleanPath)) {
+      return _pathCache[cleanPath]!;
+    }
+
+    String currentUuid = baseFolderUUID;
+    String resolvedPath = '/';
+    Map<String, dynamic> currentMetadata = {'uuid': baseFolderUUID, 'name': 'Root'};
+    
     final pathParts = cleanPath.split('/').where((p) => p.isNotEmpty).toList();
-    Map<String, dynamic>? currentMetadata = {
-      'uuid': baseFolderUUID,
-      'name': 'Root'
-    };
 
     for (var i = 0; i < pathParts.length; i++) {
       final part = pathParts[i];
       final isLastPart = (i == pathParts.length - 1);
+      final currentPartPath = '$resolvedPath$part'.replaceAll('//', '/');
+
+      // Check cache for intermediate steps
+      if (_pathCache.containsKey(currentPartPath.replaceAll(RegExp(r'^/'), ''))) {
+         final cached = _pathCache[currentPartPath.replaceAll(RegExp(r'^/'), '')]!;
+         currentUuid = cached['uuid'];
+         currentMetadata = cached['metadata'] ?? cached;
+         resolvedPath = '$currentPartPath/';
+         if (isLastPart) return cached;
+         continue;
+      }
 
       final folders = await listFoldersAsync(currentUuid, detailed: true);
-
       Map<String, dynamic>? foundFolder;
+      
       for (var folder in folders) {
         if (folder['name'] == part) {
           foundFolder = folder;
@@ -3662,16 +3705,20 @@ class FilenClient {
         currentUuid = foundFolder['uuid'];
         currentMetadata = foundFolder;
         resolvedPath = '$resolvedPath$part/'.replaceAll('//', '/');
-
-        if (isLastPart) {
-          return {
-            'type': 'folder',
-            'uuid': foundFolder['uuid'],
-            'metadata': foundFolder,
-            'path': resolvedPath.substring(0, resolvedPath.length - 1),
-            'parent': foundFolder['parent'],
-          };
-        }
+        
+        final result = {
+          'type': 'folder',
+          'uuid': foundFolder['uuid'],
+          'metadata': foundFolder,
+          'path': resolvedPath.substring(0, resolvedPath.length - 1),
+          'parent': foundFolder['parent'],
+        };
+        
+        // Populate Cache
+        _pathCache[result['path']] = result;
+        
+        if (isLastPart) return result;
+        
       } else if (foundFile != null && isLastPart) {
         resolvedPath = '$resolvedPath$part'.replaceAll('//', '/');
         return {
@@ -3682,8 +3729,7 @@ class FilenClient {
           'parent': currentUuid,
         };
       } else {
-        final currentPath = '/' + pathParts.sublist(0, i + 1).join('/');
-        throw Exception("Path not found: $currentPath");
+        throw Exception("Path not found: $resolvedPath$part");
       }
     }
 
@@ -3706,10 +3752,14 @@ class FilenClient {
       return List<Map<String, dynamic>>.from(cached.items);
     }
 
-    final d = (await _post('/v3/dir/content', {'uuid': u}))['data']['folders'];
+    final response = await _post('/v3/dir/content', {'uuid': u});
+    // Handle case where 'folders' might be null
+    final d = response['data']['folders'] ?? [];
+    
     List<Map<String, dynamic>> res = [];
 
     for (var f in d) {
+      // Basic Dict parsing (dir/content usually returns dicts, not lists)
       try {
         var dec = await _tryDecrypt(f['name']);
         var name = dec.startsWith('{') ? json.decode(dec)['name'] : dec;
@@ -3735,14 +3785,12 @@ class FilenClient {
     _folderCache[u] = _CacheEntry(items: res, timestamp: DateTime.now());
 
     if (!detailed) {
-      return res
-          .map((item) => {
-                'type': item['type'],
-                'name': item['name'],
-                'uuid': item['uuid'],
-                'size': item['size'],
-              })
-          .toList();
+      return res.map((item) => {
+        'type': item['type'],
+        'name': item['name'],
+        'uuid': item['uuid'],
+        'size': item['size'],
+      }).toList();
     }
     return res;
   }
@@ -3756,45 +3804,45 @@ class FilenClient {
       return List<Map<String, dynamic>>.from(cached.items);
     }
 
-    final d = (await _post('/v3/dir/content', {'uuid': u}))['data']['uploads'];
-    final res = await Future.wait((d as List)
-        .map((f) async {
-          try {
-            final m = json.decode(await _tryDecrypt(f['metadata']));
-            return {
-              'type': 'file',
-              'name': m['name'],
-              'uuid': f['uuid'],
-              'size': m['size'],
-              'parent': f['parent'],
-              'timestamp': f['timestamp'],
-              'lastModified': m['lastModified'],
-            };
-          } catch (_) {
-            return {
-              'type': 'file',
-              'name': '[Encrypted]',
-              'uuid': f['uuid'],
-              'size': 0,
-            };
-          }
-        })
-        .toList()
-        .cast<Future<Map<String, dynamic>>>());
+    final response = await _post('/v3/dir/content', {'uuid': u});
+    final d = response['data']['uploads'] ?? [];
+    
+    final res = await Future.wait((d as List).map((f) async {
+      try {
+        final m = json.decode(await _tryDecrypt(f['metadata']));
+        return {
+          'type': 'file',
+          'name': m['name'],
+          'uuid': f['uuid'],
+          'size': m['size'],
+          'parent': f['parent'],
+          'timestamp': f['timestamp'],
+          'lastModified': m['lastModified'],
+        };
+      } catch (_) {
+        return {
+          'type': 'file',
+          'name': '[Encrypted]',
+          'uuid': f['uuid'],
+          'size': 0,
+        };
+      }
+    }).toList());
 
-    _fileCache[u] = _CacheEntry(items: res, timestamp: DateTime.now());
+    // Cast to correct type
+    final typedRes = res.cast<Map<String, dynamic>>();
+
+    _fileCache[u] = _CacheEntry(items: typedRes, timestamp: DateTime.now());
 
     if (!detailed) {
-      return res
-          .map((item) => {
-                'type': item['type'],
-                'name': item['name'],
-                'uuid': item['uuid'],
-                'size': item['size'],
-              })
-          .toList();
+      return typedRes.map((item) => {
+        'type': item['type'],
+        'name': item['name'],
+        'uuid': item['uuid'],
+        'size': item['size'],
+      }).toList();
     }
-    return res;
+    return typedRes;
   }
 
   // --- CRYPTO PRIMITIVES ---
