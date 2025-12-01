@@ -1,8 +1,10 @@
 // lib/services/cloud_storage_interface.dart
 import 'dart:typed_data';
+
 import 'filen_client_adapter.dart';
-import 'internxt_client_adapter.dart'; //
+import 'internxt_client_adapter.dart';
 import 'sftp_client_adapter.dart';
+import 'webdav_client_adapter.dart';
 
 /// Abstract interface for cloud storage providers
 abstract class CloudStorageClient {
@@ -48,7 +50,8 @@ abstract class CloudStorageClient {
 enum CloudProvider {
   filen,
   internxt,
-  sftp
+  sftp,
+  webdav
 }
 
 /// Factory for creating cloud storage clients
@@ -72,6 +75,8 @@ class CloudStorageFactory {
           return FilenClientAdapter(config: config);
         case CloudProvider.sftp:
           return SFTPClientAdapter(config: config);
+        case CloudProvider.webdav:
+          return WebDavClientAdapter(config: config);
         case CloudProvider.internxt:
           if (isInternxtSupported) {
              return InternxtClientAdapter(config: config);

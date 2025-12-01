@@ -22,6 +22,8 @@ class _ConnectionDialogState extends State<ConnectionDialog> {
   final _portController = TextEditingController(text: '22'); // Default SFTP port
   final _sftpUserController = TextEditingController();
 
+  
+
   bool _isLoading = false;
   bool _needs2fa = false;
   String? _error;
@@ -34,6 +36,7 @@ class _ConnectionDialogState extends State<ConnectionDialog> {
     // Determine which fields to show based on provider
     final isSftp = _selectedProvider == CloudProvider.sftp; // Ensure CloudProvider.sftp exists in your enum
     final isInternxt = _selectedProvider == CloudProvider.internxt;
+    final isWebDav = _selectedProvider == CloudProvider.webdav;
 
     return AlertDialog(
       title: const Text('Connect to Cloud Storage'),
@@ -59,6 +62,11 @@ class _ConnectionDialogState extends State<ConnectionDialog> {
                 const DropdownMenuItem(
                   value: CloudProvider.sftp, 
                   child: Text('SFTP / Storage Box'),
+                ),
+                // WebDAV
+                const DropdownMenuItem(
+                  value: CloudProvider.webdav,
+                  child: Text('WebDAV'),
                 ),
                 // Internxt (Conditional)
                 DropdownMenuItem(
@@ -153,6 +161,29 @@ class _ConnectionDialogState extends State<ConnectionDialog> {
                 ),
                 enabled: !_isLoading,
               ),
+            ] else if (isWebDav) ...[
+               // WebDAV Fields
+               TextField(
+                controller: _hostController,
+                decoration: const InputDecoration(
+                  labelText: 'Server URL',
+                  hintText: 'https://cloud.example.com/remote.php/dav/files/user/',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.link),
+                ),
+                enabled: !_isLoading,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _emailController, // Reuse as Username
+                decoration: const InputDecoration(
+                  labelText: 'Username',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.person),
+                ),
+                enabled: !_isLoading,
+              ),
+            
             ] else ...[
               // Standard: Email
               TextField(
@@ -241,6 +272,12 @@ class _ConnectionDialogState extends State<ConnectionDialog> {
         // The adapter must parse this format.
         final port = _portController.text.isEmpty ? '22' : _portController.text;
         identity = '${_sftpUserController.text}@${_hostController.text}:$port';
+      } else if (_selectedProvider == CloudProvider.webdav) {
+         if (_hostController.text.isEmpty || _emailController.text.isEmpty) {
+            throw Exception('Server URL and Username are required');
+         }
+         // Pack as: username@https://server.com/dav
+         identity = '${_emailController.text}@${_hostController.text}';
       } else {
         // Standard Email
         if (_emailController.text.isEmpty) {

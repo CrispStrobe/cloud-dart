@@ -12,8 +12,12 @@ import 'filen_client_adapter.dart';
 import 'internxt_client_adapter.dart';
 import 'sftp_client_adapter.dart';
 
+import 'webdav_client_adapter.dart';
+import 'webdav_config_service.dart';
+
 import 'filen_config_service.dart'; // Needed for type checking
 import 'sftp_config_service.dart';  // Needed for switching
+
 import 'internxt_client.dart';      // Needed for type checking
 
 import 'share_service.dart';
@@ -284,6 +288,7 @@ class AppState extends ChangeNotifier {
     switch (provider) {
       case CloudProvider.filen: providerKey = 'filen'; break;
       case CloudProvider.sftp: providerKey = 'sftp'; break;
+      case CloudProvider.webdav: providerKey = 'webdav'; break;
       case CloudProvider.internxt: providerKey = 'internxt'; break;
     }
     await prefs.setString('cloud_provider', providerKey);
@@ -295,6 +300,8 @@ class AppState extends ChangeNotifier {
       _config = FilenConfigService(configPath: _configPath);
     } else if (provider == CloudProvider.sftp) {
       _config = SFTPConfigService(configPath: _configPath);
+    } else if (provider == CloudProvider.webdav) { 
+      _config = WebDavConfigService(configPath: _configPath);
     } else if (provider == CloudProvider.internxt) {
       _config = ConfigService(configPath: _configPath);
     }
@@ -471,6 +478,19 @@ class AppState extends ChangeNotifier {
         } else {
           print('⚠️ SFTP: No saved credentials found');
         }
+      } else if (_cloudClient is WebDavClientAdapter) {
+        final adapter = _cloudClient as WebDavClientAdapter;
+        final creds = await adapter.config.readCredentials();
+        
+        if (creds != null && creds['host'] != null && creds['username'] != null) {
+          _userEmail = '${creds['username']}@${creds['host']}';
+          _isConnected = true;
+          print('✅ WebDAV: Auto-login successful for $_userEmail');
+          await refreshPanel(PanelSide.remote);
+          notifyListeners();
+        } else {
+          print('⚠️ WebDAV: No credentials found');
+        }
       }
     } catch (e) {
       print('⚠️ Auto-login exception: $e');
@@ -503,7 +523,6 @@ class AppState extends ChangeNotifier {
   List<OperationProgress> get operations => _operations;
   bool get hasActiveOperations => _operations.any((op) => !op.isComplete);
 
-  // CHANGED: Uses cloud client abstraction
   Future<void> login(String email, String password, String? tfaCode) async {
     await _cloudClient.login(email, password, twoFactorCode: tfaCode);
     
@@ -526,11 +545,21 @@ class AppState extends ChangeNotifier {
       }
     } else if (_cloudClient is FilenClientAdapter) {
       final adapter = _cloudClient as FilenClientAdapter;
-      // Credentials are saved inside the adapter's login method
-      // Just verify they were saved
       final savedCreds = await adapter.filenConfig.readCredentials();
       if (savedCreds == null) {
-        print('⚠️ Warning: Credentials were not saved properly');
+        print('⚠️ Warning: Filen credentials were not saved properly');
+      }
+    } else if (_cloudClient is SFTPClientAdapter) {
+      final adapter = _cloudClient as SFTPClientAdapter;
+      final savedCreds = await adapter.config.readCredentials();
+      if (savedCreds == null) {
+        print('⚠️ Warning: SFTP credentials were not saved properly');
+      }
+    } else if (_cloudClient is WebDavClientAdapter) {
+      final adapter = _cloudClient as WebDavClientAdapter;
+      final savedCreds = await adapter.config.readCredentials();
+      if (savedCreds == null) {
+        print('⚠️ Warning: WebDAV credentials were not saved properly');
       }
     }
     
@@ -541,7 +570,6 @@ class AppState extends ChangeNotifier {
     await refreshPanel(PanelSide.remote);
   }
 
-  // CHANGED: Uses cloud client abstraction
   Future<void> logout() async {
     await _cloudClient.logout();
     
@@ -549,6 +577,10 @@ class AppState extends ChangeNotifier {
       await (_cloudClient as InternxtClientAdapter).config.clearCredentials();
     } else if (_cloudClient is FilenClientAdapter) {
       await (_cloudClient as FilenClientAdapter).filenConfig.clearCredentials();
+    } else if (_cloudClient is SFTPClientAdapter) {
+      await (_cloudClient as SFTPClientAdapter).config.clearCredentials();
+    } else if (_cloudClient is WebDavClientAdapter) {
+      await (_cloudClient as WebDavClientAdapter).config.clearCredentials();
     }
     
     _isConnected = false;
@@ -830,6 +862,9 @@ class AppState extends ChangeNotifier {
     } else if (_cloudClient is SFTPClientAdapter) {
       creds = await (_cloudClient as SFTPClientAdapter).config.readCredentials();
       if (creds != null) identityLog = '${creds['username']}@${creds['host']}';
+    } else if (_cloudClient is WebDavClientAdapter) {
+      creds = await (_cloudClient as WebDavClientAdapter).config.readCredentials();
+      if (creds != null) identityLog = '${creds['username']}@${creds['host']}';
     }
     
     if (creds == null) {
@@ -1102,6 +1137,9 @@ class AppState extends ChangeNotifier {
       identityLog = creds?['email'];
     } else if (_cloudClient is SFTPClientAdapter) {
       creds = await (_cloudClient as SFTPClientAdapter).config.readCredentials();
+      if (creds != null) identityLog = '${creds['username']}@${creds['host']}';
+    } else if (_cloudClient is WebDavClientAdapter) {
+      creds = await (_cloudClient as WebDavClientAdapter).config.readCredentials();
       if (creds != null) identityLog = '${creds['username']}@${creds['host']}';
     }
     

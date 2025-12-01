@@ -50,6 +50,7 @@ dependencies:
   shelf_router: ^1.1.0 # Good for adding other handlers
   shelf_dav: ^1.0.0  # The server
   file: ^7.0.0       # The virtual filesystem interface
+  webdav_client: ^1.2.2
 
 dev_dependencies:
   flutter_test:
