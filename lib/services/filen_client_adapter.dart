@@ -4,6 +4,7 @@ import 'filen.dart';
 import 'filen_config_service.dart';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart'; // for kIsWeb
 
 class FilenClientAdapter implements CloudStorageClient {
   final FilenClient _client;
@@ -140,36 +141,43 @@ class FilenClientAdapter implements CloudStorageClient {
   }
   
   @override
+  @override
   Future<void> uploadFile(
     List<int> fileData,
     String fileName,
     String targetPath, {
     Function(int, int)? onProgress,
   }) async {
-    // FilenClient expects a File object, so we write to temp first
+    // Resolve Target
+    final resolvedFolder = await _client.resolvePath(targetPath);
+    if (resolvedFolder['type'] != 'folder') {
+      throw Exception('Target path is not a folder');
+    }
+    final parentUuid = resolvedFolder['uuid'];
+
+    // --- WEB SUPPORT ---
+    if (kIsWeb) {
+      // Use the memory-based upload
+      await _client.uploadBytes(
+        Uint8List.fromList(fileData),
+        fileName,
+        parentUuid,
+        onProgress: onProgress,
+      );
+      return;
+    }
+    // --- END WEB Logic ---
+
+    // Desktop/Mobile Logic (Write to Temp File)
     final tempDir = Directory.systemTemp;
     final tempFile = File('${tempDir.path}/$fileName');
     await tempFile.writeAsBytes(fileData);
     
     try {
-      // 1. Resolve the target directory to get its UUID
-      final resolvedFolder = await _client.resolvePath(targetPath);
-      if (resolvedFolder['type'] != 'folder') {
-        throw Exception('Target path is not a folder');
-      }
-      final parentUuid = resolvedFolder['uuid'];
-
-      // 2. Use the single file upload method from FilenClient
-      // This maps to `Future<void> uploadFile(File file, String parent, ...)` in filen.dart
       await _client.uploadFile(
         tempFile,
         parentUuid,
-        // We can't easily hook into the exact byte-stream progress here without modifying 
-        // the core HttpClient in FilenClient, but since we are uploading from a temp file,
-        // the client handles chunking.
       );
-      
-      // Manually trigger 100% progress if successful (as the internal client handles chunks)
       if (onProgress != null) {
         onProgress(fileData.length, fileData.length);
       }

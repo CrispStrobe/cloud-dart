@@ -954,6 +954,7 @@ class AppState extends ChangeNotifier {
     
     try {
       for (int i = 0; i < files.length; i++) {
+        // 1. Check Cancellation/Pause
         if (operation.isCancelled) {
           print('🚫 Upload cancelled by user');
           break;
@@ -980,7 +981,6 @@ class AppState extends ChangeNotifier {
         print('Name: ${file.name}');
         print('Path: ${file.path}');
         print('Size: ${fileProgress.size} bytes');
-        print('Is folder: ${file.isFolder}');
         
         if (file.path == null) {
           print('❌ ERROR: File has no path, skipping');
@@ -990,51 +990,64 @@ class AppState extends ChangeNotifier {
         }
 
         try {
-          // We use the cloud client abstraction
           if (file.isFolder) {
             await _uploadFolderViaClient(file.path!, target, operation);
           } else {
-            // We use _localFileService to read data securely
-            // This ensures macOS security scope is active during the read
+            // --- STEP A: READ FILE TO MEMORY ---
+            print('   📖 Reading file into memory (Size: ${fileProgress.size})...');
+            final startRead = DateTime.now();
+            
+            // CRITICAL LIMITATION: This loads the ENTIRE file into RAM.
             final fileData = await _localFileService.readFile(
               file.path!, 
-              fileItem: file // Here we pass the FileItem so WebService can find the file reference.
+              fileItem: file 
             );
             
+            final readTime = DateTime.now().difference(startRead).inMilliseconds;
+            print('   ✅ Read complete (${readTime}ms). Starting upload...');
+
+            // --- STEP B: UPLOAD MEMORY BUFFER ---
             await _cloudClient.uploadFile(
               fileData,
               file.name,
               target,
               onProgress: (current, total) {
+                // Update State
                 operation.currentBytes = completedBytes + current;
                 notifyListeners();
+
+                // Throttle Console Logs (Only log every ~5MB or at 100%)
+                if (total > 0 && (current % (1024 * 1024 * 5) < 1024 * 64 || current == total)) {
+                   final pct = (current / total * 100).toStringAsFixed(1);
+                   print('   🚀 Uploading: $pct% ($current/$total)');
+                }
               },
             );
           }
           
-          print('✅ Upload complete: ${file.name}');
+          print('   ✅ Upload complete: ${file.name}');
           
           fileProgress.isComplete = true;
           completedBytes += fileProgress.size;
           operation.currentBytes = completedBytes;
-          
-          print('📊 Overall progress: ${operation.currentBytes}/${operation.totalBytes} bytes (${(operation.progress * 100).toStringAsFixed(1)}%)');
           notifyListeners();
           
         } catch (e, stackTrace) {
           if (operation.isCancelled || e.toString().contains('Cancelled')) {
             print('🚫 File upload cancelled: ${file.name}');
             fileProgress.error = 'Cancelled';
-            break;
+            break; // Stop batch
           } else {
             print('❌ UPLOAD FAILED: ${file.name}');
             print('   Error: $e');
+            print('   Stack: $stackTrace');
             fileProgress.error = e.toString();
           }
           notifyListeners();
         }
       }
 
+      // Final Status Check
       if (operation.isCancelled) {
         print('🚫 Upload operation cancelled');
         operation.fail('Cancelled by user');
@@ -1058,44 +1071,8 @@ class AppState extends ChangeNotifier {
     
     notifyListeners();
     
-    print('');
-    print('═══════════════════════════════════════════');
-    print('📤 UPLOAD BATCH COMPLETE');
-    print('═══════════════════════════════════════════');
-    print('');
-    
     await refreshPanel(PanelSide.remote);
     clearSelection(PanelSide.local);
-  }
-
-  void pauseOperation(String operationId) {
-    final operation = _operations.firstWhere(
-      (op) => op.id == operationId,
-      orElse: () => throw Exception('Operation not found'),
-    );
-    
-    operation.pause();
-    notifyListeners();
-  }
-
-  void resumeOperation(String operationId) {
-    final operation = _operations.firstWhere(
-      (op) => op.id == operationId,
-      orElse: () => throw Exception('Operation not found'),
-    );
-    
-    operation.resume();
-    notifyListeners();
-  }
-
-  void cancelOperation(String operationId) {
-    final operation = _operations.firstWhere(
-      (op) => op.id == operationId,
-      orElse: () => throw Exception('Operation not found'),
-    );
-    
-    operation.cancel();
-    notifyListeners();
   }
 
   Future<int> _calculateFolderSize(String folderPath) async {
@@ -1652,6 +1629,37 @@ class AppState extends ChangeNotifier {
       _isSearching = false;
       notifyListeners();
       return [];
+    }
+  }
+
+  void pauseOperation(String operationId) {
+    try {
+      final operation = _operations.firstWhere((op) => op.id == operationId);
+      operation.pause();
+      notifyListeners();
+    } catch (e) {
+      print('⚠️ Error pausing operation: $e');
+    }
+  }
+
+  void resumeOperation(String operationId) {
+    try {
+      final operation = _operations.firstWhere((op) => op.id == operationId);
+      operation.resume();
+      notifyListeners();
+    } catch (e) {
+      print('⚠️ Error resuming operation: $e');
+    }
+  }
+
+  void cancelOperation(String operationId) {
+    try {
+      final operation = _operations.firstWhere((op) => op.id == operationId);
+      operation.cancel();
+      // Optionally remove it immediately or let the UI handle it
+      notifyListeners();
+    } catch (e) {
+      print('⚠️ Error cancelling operation: $e');
     }
   }
 }

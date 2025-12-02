@@ -113,6 +113,12 @@ This project uses a modular Adapter pattern to abstract specific cloud provider 
     * **Desktop/Mobile:** Uses `dart:io` and platform-specific bookmarks.
     * **Web:** Uses a virtual in-memory file tree and `universal_html` for Blob handling.
 
+## Architecture
+
+Known limitations:
+
+* Current architecture will fail e.g. on uploading **large files** (esp. if larger than available free RAM). We could fix this if needed (we would change LocalFileService to return a Stream<List<int>> instead of Uint8List, update CloudStorageClient to accept a Stream, rewrite e.g. FilenClient.uploadFile to encrypt and upload chunks as they stream in, without holding the full file in memory).
+
 ## 📄 License
 
 This project is licensed under the **GNU Affero General Public License v3.0**. See the `LICENSE` file for details.

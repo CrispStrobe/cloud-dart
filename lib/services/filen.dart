@@ -3,7 +3,8 @@
 /// ---------------------------------------------------------------------------
 /// FILEN CLI (v0.0.4)
 /// ---------------------------------------------------------------------------
-
+import 'package:flutter/foundation.dart'; // For kIsWeb
+import 'package:universal_html/html.dart' as html; // For Web Crypto
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -18,8 +19,10 @@ import 'package:path/path.dart' as p;
 import 'package:pointycastle/export.dart' hide Digest, HMac, SHA512Digest;
 import 'package:glob/glob.dart';
 import 'package:glob/list_local_fs.dart';
+import 'dart:js_util' as js_util; // For calling JS methods safely
 
 // WebDAV Imports
+import 'package:shelf/shelf.dart'; // for Pipeline/Middleware
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_dav/shelf_dav.dart'; // Exports: ShelfDAV, DAVConfig, BasicAuthenticationProvider, RoleBasedAuthorizationProvider
 import 'package:file/file.dart' as file_pkg;
@@ -1546,9 +1549,40 @@ class FilenCLI {
       // Create ShelfDAV instance
       final dav = ShelfDAV.withConfig(davConfig);
 
+      // --- FIX: ADD CORS MIDDLEWARE ---
+      final handler = const Pipeline()
+          .addMiddleware((innerHandler) {
+            return (request) async {
+              // Handle Pre-flight OPTIONS request
+              if (request.method == 'OPTIONS') {
+                return Response.ok('', headers: {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, OPTIONS',
+                  'Access-Control-Allow-Headers': 'Origin, Content-Type, Authorization, Depth, Destination, If-None-Match, If-Match, If-Modified-Since',
+                  'Access-Control-Expose-Headers': 'DAV, ETag, Link',
+                  'Access-Control-Max-Age': '86400',
+                });
+              }
+              
+              // Forward request
+              final response = await innerHandler(request);
+              
+              // Add CORS headers to actual response
+              return response.change(headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Expose-Headers': 'DAV, ETag, Link',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, OPTIONS',
+                 // Important: Add any other headers your client sends
+                'Access-Control-Allow-Headers': 'Origin, Content-Type, Authorization, Depth, Destination, If-None-Match, If-Match, If-Modified-Since',
+              });
+            };
+          })
+          .addHandler(dav.handler);
+      // --------------------------------
+
       // Start the shelf server
       final server = await shelf_io.serve(
-        dav.handler,
+        handler, // Use the new handler with CORS
         '0.0.0.0',
         port,
       );
@@ -2752,6 +2786,162 @@ class FilenClient {
     _invalidateCache(parent);
   }
 
+  // --- In-Memory Upload for Web ---
+  Future<void> uploadBytes(
+    Uint8List data,
+    String fileName,
+    String parentUuid, {
+    Function(int bytesUploaded, int totalBytes)? onProgress,
+  }) async {
+    _log('🚀 [Web] Starting memory upload for $fileName (${formatSize(data.length)})');
+    
+    final size = data.length;
+    final uuid = _uuid();
+    final mk = masterKeys?.last ?? '';
+    if (mk.isEmpty) throw Exception('No master keys available');
+
+    final fileKeyStr = _randomString(32);
+    final fileKeyBytes = Uint8List.fromList(utf8.encode(fileKeyStr));
+
+    // Handle Empty File
+    if (size == 0) {
+      _log('   Creating empty file...');
+      final metaJson = json.encode({
+        'name': fileName,
+        'size': 0,
+        'mime': 'application/octet-stream',
+        'key': fileKeyStr,
+        'hash': '',
+        'lastModified': DateTime.now().millisecondsSinceEpoch,
+      });
+
+      final nameEncrypted = await _encryptMetadata002(fileName, fileKeyStr);
+      final sizeEncrypted = await _encryptMetadata002('0', fileKeyStr);
+      final mimeEncrypted = await _encryptMetadata002('application/octet-stream', fileKeyStr);
+      final metadataEncrypted = await _encryptMetadata002(metaJson, mk);
+      final nameHashed = await _hashFileName(fileName);
+
+      await _post('/v3/upload/empty', {
+        'uuid': uuid,
+        'name': nameEncrypted,
+        'nameHashed': nameHashed,
+        'size': sizeEncrypted,
+        'parent': parentUuid,
+        'mime': mimeEncrypted,
+        'metadata': metadataEncrypted,
+        'version': 2,
+      });
+      
+      if (onProgress != null) onProgress(0, 0);
+      _invalidateCache(parentUuid);
+      return;
+    }
+
+    // Chunked Upload
+    final uploadKey = _randomString(32);
+    final rm = _randomString(32);
+    final ingest = 'https://ingest.filen.io';
+    
+    int offset = 0;
+    int index = 0;
+    const chunkSz = 1048576; // 1MB
+    final totalChunks = (size / chunkSz).ceil();
+
+    final digestSink = DigestSink();
+    final byteSink = crypto.sha512.startChunkedConversion(digestSink);
+
+    try {
+      while (offset < size) {
+        final end = min(size, offset + chunkSz);
+        // Slice from memory instead of reading file
+        final chunkBytes = data.sublist(offset, end); 
+        
+        // Hash original bytes
+        byteSink.add(chunkBytes);
+        
+        // Encrypt
+        final encChunk = await _encryptData(chunkBytes, fileKeyBytes);
+
+        // Hash encrypted chunk for API integrity check
+        final chunkHash = crypto.sha512.convert(encChunk);
+        final hashHex = HEX.encode(chunkHash.bytes).toLowerCase();
+
+        final url = Uri.parse('$ingest/v3/upload?uuid=$uuid&index=$index&parent=$parentUuid&uploadKey=$uploadKey&hash=$hashHex');
+
+        _log('   Uploading chunk ${index + 1}/$totalChunks...');
+        
+        // Retry logic for unstable mobile connections
+        int retry = 0;
+        while (retry < 3) {
+          try {
+            final r = await http.post(
+              url,
+              body: encChunk,
+              headers: {'Authorization': 'Bearer $apiKey'},
+            ).timeout(const Duration(seconds: 45));
+
+            if (r.statusCode != 200) {
+              throw Exception('Status ${r.statusCode}: ${r.body}');
+            }
+            break; // Success
+          } catch (e) {
+            retry++;
+            _log('   ⚠️ Chunk failed (Attempt $retry): $e');
+            if (retry >= 3) throw e;
+            await Future.delayed(const Duration(seconds: 1));
+          }
+        }
+
+        offset += chunkBytes.length;
+        index++;
+        
+        if (onProgress != null) {
+          onProgress(offset, size);
+        }
+      }
+
+      byteSink.close();
+      final totalHash = HEX.encode(digestSink.value?.bytes ?? []).toLowerCase();
+
+      // Finalize
+      _log('   Finalizing upload...');
+      final metaJsonWithHash = json.encode({
+        'name': fileName,
+        'size': size,
+        'mime': 'application/octet-stream',
+        'key': fileKeyStr,
+        'hash': totalHash,
+        'lastModified': DateTime.now().millisecondsSinceEpoch,
+      });
+
+      final nameEncrypted = await _encryptMetadata002(fileName, fileKeyStr);
+      final sizeEncrypted = await _encryptMetadata002(size.toString(), fileKeyStr);
+      final mimeEncrypted = await _encryptMetadata002('application/octet-stream', fileKeyStr);
+      final metadataEncryptedWithHash = await _encryptMetadata002(metaJsonWithHash, mk);
+      final nameHashed = await _hashFileName(fileName);
+
+      await _post('/v3/upload/done', {
+        'uuid': uuid,
+        'name': nameEncrypted,
+        'nameHashed': nameHashed,
+        'size': sizeEncrypted,
+        'chunks': index,
+        'mime': mimeEncrypted,
+        'rm': rm,
+        'metadata': metadataEncryptedWithHash,
+        'version': 2,
+        'uploadKey': uploadKey,
+      });
+
+      _invalidateCache(parentUuid);
+      _log('✅ Upload complete!');
+
+    } catch (e) {
+      _log('❌ Upload Exception: $e');
+      rethrow;
+    }
+  }
+
   // ============================================================================
   // 7. UPDATE: Upload with chunk-level resume
   // ============================================================================
@@ -3025,6 +3215,47 @@ class FilenClient {
     }
   }
 
+  /// Download file directly to memory (Uint8List) without writing to disk.
+  Future<Uint8List> downloadFileBytes(
+    String uuid, {
+    Function(int bytesDownloaded, int totalBytes)? onProgress,
+  }) async {
+    _log('Downloading file to memory: $uuid');
+
+    // 1. Fetch File Metadata
+    final info = await _post('/v3/file', {'uuid': uuid});
+    final d = info['data'];
+
+    // 2. Decrypt Metadata
+    final metaStr = await _tryDecrypt(d['metadata']);
+    final meta = json.decode(metaStr);
+    final keyBytes = _decodeUniversalKey(meta['key']);
+    final chunks = int.parse(d['chunks'].toString());
+    final host = 'https://egest.filen.io'; 
+
+    final fileSize = meta['size'] ?? 0;
+
+    final buffer = BytesBuilder(copy: false); 
+    int bytesDownloaded = 0;
+
+    for (var i = 0; i < chunks; i++) {
+      final r = await http
+          .get(Uri.parse('$host/${d['region']}/${d['bucket']}/$uuid/$i'));
+      if (r.statusCode != 200) throw Exception('Chunk download failed: $i');
+
+      final decrypted = await _decryptData(r.bodyBytes, keyBytes);
+      buffer.add(decrypted);
+
+      bytesDownloaded += decrypted.length;
+
+      if (onProgress != null) {
+        onProgress(bytesDownloaded, fileSize);
+      }
+    }
+
+    return buffer.takeBytes();
+  }
+
   /// Download file with range support
   Future<Uint8List> downloadFileRange(
     String uuid, {
@@ -3073,51 +3304,6 @@ class FilenClient {
     }
 
     return buffer.toBytes();
-  }
-
-  /// Download file directly to memory (Uint8List) without writing to disk.
-  /// Used for Web downloads where file system access is restricted.
-  Future<Uint8List> downloadFileBytes(
-    String uuid, {
-    Function(int bytesDownloaded, int totalBytes)? onProgress,
-  }) async {
-    _log('Downloading file to memory: $uuid');
-
-    // 1. Fetch File Metadata
-    final info = await _post('/v3/file', {'uuid': uuid});
-    final d = info['data'];
-
-    // 2. Decrypt Metadata
-    final metaStr = await _tryDecrypt(d['metadata']);
-    final meta = json.decode(metaStr);
-    final keyBytes = _decodeUniversalKey(meta['key']);
-    final chunks = int.parse(d['chunks'].toString());
-    final host = 'https://egest.filen.io'; 
-
-    final fileSize = meta['size'] ?? 0;
-
-    // Use BytesBuilder to collect chunks efficiently in memory
-    final buffer = BytesBuilder(copy: false); 
-    int bytesDownloaded = 0;
-
-    // 3. Download Chunks
-    for (var i = 0; i < chunks; i++) {
-      final r = await http
-          .get(Uri.parse('$host/${d['region']}/${d['bucket']}/$uuid/$i'));
-      if (r.statusCode != 200) throw Exception('Chunk download failed: $i');
-
-      // 4. Decrypt Chunk
-      final decrypted = await _decryptData(r.bodyBytes, keyBytes);
-      buffer.add(decrypted);
-
-      bytesDownloaded += decrypted.length;
-
-      if (onProgress != null) {
-        onProgress(bytesDownloaded, fileSize);
-      }
-    }
-
-    return buffer.takeBytes();
   }
 
   Future<Map<String, dynamic>> downloadFile(
@@ -3916,6 +4102,41 @@ class FilenClient {
   }
 
   Future<Uint8List> _encryptData(Uint8List d, Uint8List k) async {
+    if (kIsWeb) {
+      try {
+        final iv = _randomBytes(12);
+        
+        // FIX: Rename to webCrypto
+        final webCrypto = html.window.crypto;
+        final subtle = js_util.getProperty(webCrypto!, 'subtle');
+
+        // Import Key
+        final keyParams = js_util.newObject();
+        js_util.setProperty(keyParams, 'name', 'AES-GCM');
+        
+        final keyPromise = js_util.callMethod(subtle, 'importKey', [
+          'raw', k, keyParams, false, ['encrypt']
+        ]);
+        final keyObj = await js_util.promiseToFuture(keyPromise);
+
+        // Encrypt
+        final encryptParams = js_util.newObject();
+        js_util.setProperty(encryptParams, 'name', 'AES-GCM');
+        js_util.setProperty(encryptParams, 'iv', iv);
+
+        final encPromise = js_util.callMethod(subtle, 'encrypt', [
+          encryptParams, keyObj, d
+        ]);
+        
+        final encryptedBuffer = await js_util.promiseToFuture(encPromise);
+        final encryptedBytes = Uint8List.view(encryptedBuffer);
+        
+        return Uint8List.fromList([...iv, ...encryptedBytes]);
+      } catch (e) {
+        _log('WebCrypto encrypt error: $e');
+      }
+    }
+
     final iv = _randomBytes(12);
     final c = GCMBlockCipher(AESEngine())
       ..init(true, AEADParameters(KeyParameter(k), 128, iv, Uint8List(0)));
@@ -3923,6 +4144,41 @@ class FilenClient {
   }
 
   Future<Uint8List> _decryptData(Uint8List d, Uint8List k) async {
+    if (kIsWeb) {
+      try {
+        if (d.length < 12) throw Exception('Invalid data length');
+        final iv = d.sublist(0, 12);
+        final cipherText = d.sublist(12);
+        
+        // FIX: Rename to webCrypto
+        final webCrypto = html.window.crypto;
+        final subtle = js_util.getProperty(webCrypto!, 'subtle');
+
+        // Import Key
+        final keyParams = js_util.newObject();
+        js_util.setProperty(keyParams, 'name', 'AES-GCM');
+        
+        final keyPromise = js_util.callMethod(subtle, 'importKey', [
+          'raw', k, keyParams, false, ['decrypt']
+        ]);
+        final keyObj = await js_util.promiseToFuture(keyPromise);
+
+        // Decrypt
+        final decryptParams = js_util.newObject();
+        js_util.setProperty(decryptParams, 'name', 'AES-GCM');
+        js_util.setProperty(decryptParams, 'iv', iv);
+
+        final decPromise = js_util.callMethod(subtle, 'decrypt', [
+          decryptParams, keyObj, cipherText
+        ]);
+        
+        final decryptedBuffer = await js_util.promiseToFuture(decPromise);
+        return Uint8List.view(decryptedBuffer);
+      } catch (e) {
+        // Fallback silently if tags mismatch or other crypto errors
+      }
+    }
+
     final c = GCMBlockCipher(AESEngine())
       ..init(false,
           AEADParameters(KeyParameter(k), 128, d.sublist(0, 12), Uint8List(0)));
@@ -3971,6 +4227,69 @@ class FilenClient {
   }
 
   Future<Map<String, String>> _deriveKeys(String p, int v, String s) async {
+    // --- WEB OPTIMIZATION: Safe JS Interop ---
+    if (kIsWeb) {
+      try {
+        _log('🔑 [WebCrypto] Deriving keys via js_util...');
+        final start = DateTime.now();
+
+        final passwordBytes = Uint8List.fromList(utf8.encode(p));
+        final saltBytes = Uint8List.fromList(utf8.encode(s));
+
+        // FIX: Rename variable to webCrypto to avoid shadowing package:crypto
+        final webCrypto = html.window.crypto;
+        final subtle = js_util.getProperty(webCrypto!, 'subtle');
+
+        // 1. Import Key
+        final importParams = js_util.newObject();
+        js_util.setProperty(importParams, 'name', 'PBKDF2');
+
+        final keyMaterialPromise = js_util.callMethod(subtle, 'importKey', [
+          'raw',
+          passwordBytes,
+          importParams,
+          false,
+          ['deriveBits'],
+        ]);
+        
+        final keyMaterial = await js_util.promiseToFuture(keyMaterialPromise);
+
+        // 2. Derive Bits
+        final deriveParams = js_util.newObject();
+        js_util.setProperty(deriveParams, 'name', 'PBKDF2');
+        js_util.setProperty(deriveParams, 'salt', saltBytes);
+        js_util.setProperty(deriveParams, 'iterations', 200000);
+        js_util.setProperty(deriveParams, 'hash', 'SHA-512');
+
+        final bitsPromise = js_util.callMethod(subtle, 'deriveBits', [
+          deriveParams,
+          keyMaterial,
+          512 // 64 bytes * 8 bits
+        ]);
+
+        final derivedByteBuffer = await js_util.promiseToFuture(bitsPromise);
+        final derivedList = Uint8List.view(derivedByteBuffer);
+        
+        final k = HEX.encode(derivedList).toLowerCase();
+
+        print('✅ [WebCrypto] Key derived in ${DateTime.now().difference(start).inMilliseconds}ms');
+
+        return (v == 2)
+            ? {
+                'masterKey': k.substring(0, 64),
+                // Now 'crypto' correctly refers to the package import
+                'password': HEX
+                    .encode(crypto.sha512.convert(utf8.encode(k.substring(64))).bytes)
+                    .toLowerCase()
+              }
+            : {'masterKey': k, 'password': k};
+      } catch (e) {
+        print('⚠️ [WebCrypto] Failed: $e');
+        // Fallthrough to Dart implementation
+      }
+    }
+    
+    // Dart Fallback
     final k = HEX
         .encode(_pbkdf2(utf8.encode(p), utf8.encode(s), 200000, 64))
         .toLowerCase();
@@ -3978,8 +4297,7 @@ class FilenClient {
         ? {
             'masterKey': k.substring(0, 64),
             'password': HEX
-                .encode(
-                    crypto.sha512.convert(utf8.encode(k.substring(64))).bytes)
+                .encode(crypto.sha512.convert(utf8.encode(k.substring(64))).bytes)
                 .toLowerCase()
           }
         : {'masterKey': k, 'password': k};
