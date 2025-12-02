@@ -140,7 +140,7 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
           
           return Scaffold(
             appBar: AppBar(
-              title: const Text('Cloud Drive'),
+              title: const Text('Crisp Cloud'),
               actions: [
                 // Keyboard shortcuts info
                 IconButton(
@@ -410,7 +410,7 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Cloud Drive',
+                  'Crisp Cloud',
                   style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                     color: Theme.of(context).colorScheme.onPrimaryContainer,
                   ),
@@ -1235,7 +1235,7 @@ class _CustomAboutDialog extends StatelessWidget {
                       const Icon(Icons.cloud_circle, size: 64, color: Colors.blue),
                       const SizedBox(height: 8),
                       Text(
-                        'Cloud Drive',
+                        'Crisp Cloud',
                         style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
                       ),
                       Text(
@@ -1296,7 +1296,7 @@ class _CustomAboutDialog extends StatelessWidget {
                     onPressed: () {
                       showLicensePage(
                         context: context,
-                        applicationName: 'Cloud Drive',
+                        applicationName: 'Crisp Cloud',
                         applicationVersion: '1.0.0',
                         applicationIcon: const Icon(Icons.cloud, size: 48),
                         applicationLegalese: '© 2025 CrispStrobe',
