@@ -637,9 +637,17 @@ class AppState extends ChangeNotifier {
         final folders = (result['folders'] as List<dynamic>?)?.map((item) {
               final map = item as Map<String, dynamic>;
               DateTime? folderDate;
-              if (map['modificationTime'] != null) {
-                try { folderDate = DateTime.parse(map['modificationTime'].toString()); } catch (_) {}
+              
+              // Check keys used by different providers
+              final rawDate = map['modificationTime'] ?? map['lastModified'] ?? map['timestamp'];
+              
+              if (rawDate != null) {
+                try { 
+                   if (rawDate is int) folderDate = DateTime.fromMillisecondsSinceEpoch(rawDate);
+                   else folderDate = DateTime.parse(rawDate.toString()); 
+                } catch (_) {}
               }
+              
               return FileItem(
                 name: map['name'] ?? 'Unknown',
                 isFolder: true,
@@ -652,7 +660,6 @@ class AppState extends ChangeNotifier {
               final map = item as Map<String, dynamic>;
               final fileName = map['name'] ?? 'Unknown';
               
-              // Logic to handle extensions ONLY if the provider separates them (like Internxt)
               final rawType = map['fileType'] ?? map['type'] ?? '';
               final fileType = rawType.toString().toLowerCase();
               
@@ -662,26 +669,22 @@ class AppState extends ChangeNotifier {
               }
                   
               DateTime? fileDate;
-              // Check 'lastModified' AND 'modificationTime'
+              // Check keys used by different providers
               final rawDate = map['modificationTime'] ?? map['lastModified'];
               
               if (rawDate != null) {
                 try { 
-                  // Handle Timestamp (int) vs ISO String
-                  if (rawDate is int) {
-                    fileDate = DateTime.fromMillisecondsSinceEpoch(rawDate);
-                  } else {
-                    fileDate = DateTime.parse(rawDate.toString()); 
-                  }
+                   if (rawDate is int) fileDate = DateTime.fromMillisecondsSinceEpoch(rawDate);
+                   else fileDate = DateTime.parse(rawDate.toString()); 
                 } catch (_) {}
               }
-
+              
               return FileItem(
                 name: fullName,
                 isFolder: false,
                 size: map['size'] as int?,
                 uuid: map['uuid'],
-                updatedAt: fileDate, 
+                updatedAt: fileDate, // should populate correctly
               );
             }).toList() ?? [];
 
